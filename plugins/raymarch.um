@@ -1,0 +1,231 @@
+// @effect raymarch "立体（レイマーチングで球・角の丸い箱・ドーナツを陰影つきで描き、層の上に重ねる）"
+// @label "立体（レイマーチング）"
+// @category style
+// @init 1
+// @thumb 0=1 1=25 2=35
+// @param shape 1 0..2 "形（0 球、1 角の丸い箱、2 ドーナツ。小数は四捨五入）"
+// @param rx 20 -720..720 "横の軸のまわりの回転（度）"
+// @param ry 30 -720..720 "縦の軸のまわりの回転（度）"
+// @param size 0.5 0.05..1.5 "大きさ（層の短い辺の半分を 1 とする）"
+// @param cx 0.5 0..1 "中心の横の位置（層の左端 0、右端 1）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の上端 0、下端 1）"
+// @param hue 200 0..360 "色相（度）"
+// @param shine 0.6 0..1 "つや（光の照り返しの強さ）"
+// @whole
+// @gpu 1
+//
+// 画素ごとに、目（z = -3）から画面の点へ光線を飛ばし、形までの距離（SDF）だけ進むことをくり返して表面を探す。
+// 表面の向き（距離の差分）で、拡散・つや・縁の光を付け、形の座標の格子で 2 色の市松にする（回っているのが見えるように）。
+// 当たらなかった光線は、いちばん近づいた所の近さで縁をぼかす（アンチエイリアス）。立体の外は層をそのまま残す。
+
+kernel function rmSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function rmClamp01(x: f32): f32 {
+  return Math.min(Math.max(x, 0.0), 1.0);
+}
+
+// 形の座標（回す前）での距離。s は大きさ。
+kernel function rmShapeDist(x: f32, y: f32, z: f32, shape: u32, s: f32): f32 {
+  if (shape == 0) {
+    return Math.sqrt(x * x + y * y + z * z) - s;
+  }
+  if (shape == 1) {
+    const r = s * 0.25;
+    const b = s * 0.75;
+    const qx = Math.abs(x) - b;
+    const qy = Math.abs(y) - b;
+    const qz = Math.abs(z) - b;
+    const ox = Math.max(qx, 0.0);
+    const oy = Math.max(qy, 0.0);
+    const oz = Math.max(qz, 0.0);
+    const outside = Math.sqrt(ox * ox + oy * oy + oz * oz);
+    const inside = Math.min(Math.max(qx, Math.max(qy, qz)), 0.0);
+    return outside + inside - r;
+  }
+  const big = s * 0.7;
+  const small = s * 0.3;
+  const qx = Math.sqrt(x * x + z * z) - big;
+  return Math.sqrt(qx * qx + y * y) - small;
+}
+
+// 世界の点 (x, y, z) を形の座標に戻してから距離を求める（X の回転を戻し、Y の回転を戻す）。
+kernel function rmDist(x: f32, y: f32, z: f32, shape: u32, s: f32, ca: f32, sa: f32, cb: f32, sb: f32): f32 {
+  const y1 = ca * y + sa * z;
+  const z1 = -sa * y + ca * z;
+  const x2 = cb * x - sb * z1;
+  const z2 = sb * x + cb * z1;
+  return rmShapeDist(x2, y1, z2, shape, s);
+}
+
+// 形の座標での市松（0 か 1）。
+kernel function rmChecker(x: f32, y: f32, z: f32, s: f32, ca: f32, sa: f32, cb: f32, sb: f32): f32 {
+  const y1 = ca * y + sa * z;
+  const z1 = -sa * y + ca * z;
+  const x2 = cb * x - sb * z1;
+  const z2 = sb * x + cb * z1;
+  const k = 3.0 / s;
+  const n = Math.floor(x2 * k + 0.001) + Math.floor(y1 * k + 0.001) + Math.floor(z2 * k + 0.001);
+  return n - 2.0 * Math.floor(n * 0.5);
+}
+
+export kernel function fx_gpu_raymarch(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  if (w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const DEG: f32 = 0.0174532925;
+  const HALF_PI: f32 = 1.57079633;
+  const shape = Math.min(Math.max(Math.floor(p[0] + 0.5), 0.0), 2.0) as u32;
+  const a = p[1] * DEG;
+  const b = p[2] * DEG;
+  const sa = rmSin(a);
+  const ca = rmSin(a + HALF_PI);
+  const sb = rmSin(b);
+  const cb = rmSin(b + HALF_PI);
+  const s = Math.max(p[3], 0.01);
+
+  const wf = w as f32;
+  const hf = h as f32;
+  const unit = 0.5 * Math.min(wf, hf);
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const ux = (px - p[4] * wf) / unit;
+  const uy = -(py - p[5] * hf) / unit;
+
+  // 目は z = -3、画面は z = 0 の面（ここで大きさ 1 が短い辺の半分になる）。
+  const EYE: f32 = 3.0;
+  const dl = Math.sqrt(ux * ux + uy * uy + EYE * EYE);
+  const dx = ux / dl;
+  const dy = uy / dl;
+  const dz = EYE / dl;
+  const pix = 1.0 / (unit * EYE);
+
+  let t: f32 = Math.max(EYE - 2.5 * s, 0.0);
+  let hit: u32 = 0;
+  let best: f32 = 1.0e9;
+  let bestT: f32 = t;
+  let step: u32 = 0;
+  const far = EYE + 3.0 * s;
+  while (step < 96 && t < far) {
+    const d = rmDist(dx * t, dy * t, dz * t - EYE, shape, s, ca, sa, cb, sb);
+    if (d < 0.0005 * s) {
+      hit = 1;
+      bestT = t;
+      break;
+    }
+    const ratio = d / (t * pix);
+    if (ratio < best) {
+      best = ratio;
+      bestT = t;
+    }
+    t = t + d * 0.9;
+    step = step + 1;
+  }
+
+  let cover: f32 = 1.0;
+  if (hit == 0) {
+    cover = rmClamp01(1.0 - best);
+    if (cover <= 0.0) {
+      dst[i] = src[i];
+      return;
+    }
+  }
+
+  // 表面の点と向き（距離の中央差分）。
+  const hx = dx * bestT;
+  const hy = dy * bestT;
+  const hz = dz * bestT - EYE;
+  const e = 0.001 * s;
+  let nx = rmDist(hx + e, hy, hz, shape, s, ca, sa, cb, sb) - rmDist(hx - e, hy, hz, shape, s, ca, sa, cb, sb);
+  let ny = rmDist(hx, hy + e, hz, shape, s, ca, sa, cb, sb) - rmDist(hx, hy - e, hz, shape, s, ca, sa, cb, sb);
+  let nz = rmDist(hx, hy, hz + e, shape, s, ca, sa, cb, sb) - rmDist(hx, hy, hz - e, shape, s, ca, sa, cb, sb);
+  const nl = Math.max(Math.sqrt(nx * nx + ny * ny + nz * nz), 1.0e-12);
+  nx = nx / nl;
+  ny = ny / nl;
+  nz = nz / nl;
+
+  // 光は左上手前から。
+  const lx: f32 = -0.48;
+  const ly: f32 = 0.66;
+  const lz: f32 = -0.58;
+  const diff = rmClamp01(nx * lx + ny * ly + nz * lz);
+  // つや（Blinn。半分の向きとの内積の 32 乗）。
+  let hvx = lx - dx;
+  let hvy = ly - dy;
+  let hvz = lz - dz;
+  const hl = Math.max(Math.sqrt(hvx * hvx + hvy * hvy + hvz * hvz), 1.0e-12);
+  let sp = rmClamp01((nx * hvx + ny * hvy + nz * hvz) / hl);
+  sp = sp * sp;
+  sp = sp * sp;
+  sp = sp * sp;
+  sp = sp * sp;
+  sp = sp * sp;
+  const spec = sp * p[7];
+  // 縁の光（見る向きと表面の向きが直角に近いほど明るい）。
+  const ndv = rmClamp01(-(nx * dx + ny * dy + nz * dz));
+  const rimB = 1.0 - ndv;
+  const rim = rimB * rimB * rimB * 0.35;
+
+  // 色相から色（彩度を少し落とす）。
+  let hu = p[6] / 360.0;
+  hu = hu - Math.floor(hu);
+  const h6 = hu * 6.0;
+  const br = rmClamp01(Math.abs(h6 - 3.0) - 1.0);
+  const bg = rmClamp01(2.0 - Math.abs(h6 - 2.0));
+  const bb = rmClamp01(2.0 - Math.abs(h6 - 4.0));
+  const chk = rmChecker(hx, hy, hz, s, ca, sa, cb, sb);
+  const tone = 0.78 + 0.22 * chk;
+  const cr = (0.25 + 0.75 * br) * tone;
+  const cg = (0.25 + 0.75 * bg) * tone;
+  const cbv = (0.25 + 0.75 * bb) * tone;
+
+  const lit = 0.18 + 0.82 * diff;
+  const r = rmClamp01(cr * lit + spec + rim);
+  const g = rmClamp01(cg * lit + spec + rim);
+  const bl = rmClamp01(cbv * lit + spec + rim);
+
+  // 層の上に重ねる（ストレートアルファ）。
+  const under = src[i];
+  const ua = under.w * (1.0 - cover);
+  const oa = cover + ua;
+  if (oa <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const or = (r * cover + under.x * ua) / oa;
+  const og = (g * cover + under.y * ua) / oa;
+  const ob = (bl * cover + under.z * ua) / oa;
+  dst[i] = vec4(or, og, ob, oa);
+}
+
+kernel function rmCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_raymarch(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_raymarch, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(rmCopy, n, mut layer, tmp);
+}
