@@ -1,0 +1,42 @@
+// @effect levels "レベル補正（入力の黒・白の点を決めて階調を引き伸ばす）"
+// @label "レベル補正"
+// @category color
+// @init 0.1
+// @param black 0 0..1 "入力の黒の点（これより暗い所を真っ黒にする）"
+// @param white 1 0..1 "入力の白の点（これより明るい所を真っ白にする）"
+// @param out_black 0 0..1 "出力の黒（真っ黒の代わりに出す明るさ。上げると黒が浮く）"
+// @param out_white 1 0..1 "出力の白（真っ白の代わりに出す明るさ。下げると白が沈む）"
+// @gpu 1
+//
+// 既定値（0・1・0・1）では何もしない。アルファは変えない。結果は 0..1 に収める。
+
+kernel function levelsMap(v: f32, ib: f32, iw: f32, ob: f32, ow: f32): f32 {
+  const t = Math.min(Math.max((v - ib) / Math.max(iw - ib, 0.0001), 0.0), 1.0);
+  return Math.min(Math.max(ob + t * (ow - ob), 0.0), 1.0);
+}
+
+export kernel function fx_gpu_levels(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  dst[i] = vec4(
+    levelsMap(c.x, p[0], p[1], p[2], p[3]),
+    levelsMap(c.y, p[0], p[1], p[2], p[3]),
+    levelsMap(c.z, p[0], p[1], p[2], p[3]),
+    c.w,
+  );
+}
+
+kernel function levelsCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_levels(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 && p[1] == 1.0 && p[2] == 0.0 && p[3] == 1.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_levels, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(levelsCopy, n, mut layer, tmp);
+}

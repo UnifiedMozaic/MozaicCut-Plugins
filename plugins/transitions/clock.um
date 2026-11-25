@@ -1,0 +1,61 @@
+// @transition clock "時計回りの扇形で次の映像へ切り替わる"
+// @label "クロックワイプ"
+
+export kernel function tr_gpu_clock(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const startNorm = angle / 360.0;
+  const dx = ((i % w) as f32 + 0.5) / (w as f32) - 0.5;
+  const dy = ((i / w) as f32 + 0.5) / (h as f32) - 0.5;
+  const vx = dx;
+  const vy = -dy;
+  const ax = Math.abs(vx);
+  const ay = Math.abs(vy);
+  const mn = Math.min(ax, ay);
+  const mx = Math.max(ax, ay);
+  let r: f32 = 0.0;
+  if (mx > 0.00001) {
+    const z = mn / mx;
+    const z2 = z * z;
+    let ang = z * (0.999866 - z2 * (0.330299 - z2 * (0.180141 - z2 * 0.085133)));
+    if (ax > ay) {
+      ang = 1.5707963 - ang;
+    }
+    if (vy < 0.0) {
+      ang = 3.14159265 - ang;
+    }
+    if (vx < 0.0) {
+      ang = 6.2831853 - ang;
+    }
+    r = ang / 6.2831853;
+  }
+  let u = r - startNorm;
+  u = u - Math.floor(u);
+  const s = Math.max(soft, 0.004);
+  const edge = p * (1.0 + s) - s * 0.5;
+  const t = Math.min(Math.max((edge - u + s * 0.5) / s, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[i];
+  const cb = b[i];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trClockCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_clock(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_clock, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trClockCopy, n, mut a, tmp);
+}

@@ -1,0 +1,117 @@
+// @effect kaleido "万華鏡（中心のまわりの扇形を鏡で折り返して並べる）"
+// @label "万華鏡"
+// @category style
+// @init 6
+// @param segments 0 0..32 "鏡の枚数（扇形の数。2 未満で何もしない）"
+// @param rotation 0 -3600..3600 "回転（度。キーフレームで動かすと模様が回る）"
+// @param cx 0.5 0..1 "中心の横の位置（層の左端 0、右端 1）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の上端 0、下端 1）"
+// @whole
+// @gpu 1
+//
+// 中心から見た角度を、扇形 1 つ分（360° / 枚数）で折り返し（偶数番目は鏡に映した向き）、同じ距離の所から取る（双線形補間）。
+
+kernel function kaleidoSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0 - Math.floor(x0 / (2.0 * PI)) * 2.0 * PI;
+  if (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+// 向き (vx, vy) の角度（0..2π。+x から +y へ回る向き）
+kernel function kaleidoAngle(vx: f32, vy: f32): f32 {
+  const ax = Math.abs(vx);
+  const ay = Math.abs(vy);
+  const mn = Math.min(ax, ay);
+  const mx = Math.max(ax, ay);
+  if (mx < 0.00001) {
+    return 0.0;
+  }
+  const z = mn / mx;
+  const z2 = z * z;
+  let a = z * (0.999866 - z2 * (0.330299 - z2 * (0.180141 - z2 * 0.085133)));
+  if (ay > ax) {
+    a = 1.5707963 - a;
+  }
+  if (vx < 0.0) {
+    a = 3.14159265 - a;
+  }
+  if (vy < 0.0) {
+    a = 6.2831853 - a;
+  }
+  return a;
+}
+
+kernel function kaleidoTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const cx = Math.min(Math.max(x, 0), (w as i32) - 1) as u32;
+  const cy = Math.min(Math.max(y, 0), (h as i32) - 1) as u32;
+  return src[cy * w + cx];
+}
+
+kernel function kaleidoSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x = fx - 0.5;
+  const y = fy - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = kaleidoTexel(src, ix, iy, w, h);
+  const b = kaleidoTexel(src, ix + 1, iy, w, h);
+  const c = kaleidoTexel(src, ix, iy + 1, w, h);
+  const d = kaleidoTexel(src, ix + 1, iy + 1, w, h);
+  const top = a + (b - a) * tx;
+  const bot = c + (d - c) * tx;
+  return top + (bot - top) * ty;
+}
+
+export kernel function fx_gpu_kaleido(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const n = Math.floor(p[0] + 0.5);
+  if (n < 2.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const wf = w as f32;
+  const hf = h as f32;
+  const ox = p[2] * wf;
+  const oy = p[3] * hf;
+  const dx = ((i % w) as f32) + 0.5 - ox;
+  const dy = ((i / w) as f32) + 0.5 - oy;
+  const r = Math.sqrt(dx * dx + dy * dy);
+  const rot = p[1] * 0.0174532925;
+  const seg = 6.2831853 / n;
+  let a = kaleidoAngle(dx, dy) - rot;
+  a = a - Math.floor(a / seg) * seg;
+  if (a > seg * 0.5) {
+    a = seg - a;
+  }
+  a = a + rot;
+  const s = kaleidoSin(a);
+  const c = kaleidoSin(a + 1.5707963);
+  dst[i] = kaleidoSample(src, ox + r * c, oy + r * s, w, h);
+}
+
+kernel function kaleidoCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_kaleido(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] < 1.5 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_kaleido, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(kaleidoCopy, n, mut layer, tmp);
+}

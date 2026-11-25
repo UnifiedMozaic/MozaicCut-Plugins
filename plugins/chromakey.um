@@ -1,0 +1,429 @@
+// @effect chromakey "クロマキー（緑や青の背景の色を透明にし、縁の色を戻し、色のこぼれを取る）"
+// @label "クロマキー"
+// @category key
+// @param tolerance 0.3 0..1 "許容（キーの色からの色の差がこれ以下なら透明。差はキーの色の鮮やかさを 1 とする。暗い背景も抜くなら上げる）"
+// @param softness 0.5 0..1 "柔らかさ（許容からこの幅で透明から不透明へ直線で変わる。0 なら 0 か 1 で、縁の推定もしない）"
+// @param spill 1 0..2 "色のこぼれの除去（0 で取らない。1 でキーの色の成分をほかの 2 つの大きいほうまで、2 で 2 つの平均まで下げる）"
+// @param shrink 0 -16..16 "エッジの収縮（画素。正で透明でない所を縮め、負で広げる。小数は四捨五入）"
+// @param feather 0 0..32 "エッジのぼかし（キーの境目をぼかす。広がりはおよそ 2×feather 画素。小数は四捨五入）"
+// @param r 0.1 0..1 "キーの色の赤（0〜1。既定はクロマキー用の緑の布の色 0.1 0.7 0.3。青の布は 0.1 0.2 0.9）"
+// @param g 0.7 0..1 "キーの色の緑"
+// @param b 0.3 0..1 "キーの色の青"
+// @whole
+//
+// 考え方（人にも AI にもわかるように）:
+// - 色を BT.709 の YCbCr に直し、明るさ（Y）を除いた色の平面（Cb, Cr）で、画素の色とキーの色の距離 d を測る。
+//   d はキーの色の鮮やかさ（Cb, Cr の長さ）で割る。キーの色そのものは 0、灰色・白・黒は 1。
+//   キーの色と灰色（や白・黒）を 1-t : t で混ぜた色の d は t。同じ色相で明るさが L 倍の背景（暗い所・影）の d は 1 - L。
+//   色だけでは「暗い背景」と「背景と黒い被写体が混ざった縁」を区別できないので、暗い背景は半透明の黒（影）になる。
+//   暗い所も透明にしたいときは許容を上げる（許容 0.5 なら、明るさが半分の背景まで透明）。
+// - キー（不透明さ）a = (d - 許容) / 柔らかさ を 0..1 に切ったもの（直線。混ざり具合にほぼ比例する）。
+//   結果のアルファ = 元のアルファ × a。アルファは元より大きくならないので、層の外へ広がらない（@reach は要らない）。
+//   元のアルファが 0 の画素はキーに関わらない（a = 1 として収縮・ぼかしに渡す。透明な所の見えない色で縁が削れないように）。
+// - 縁の色を戻す（背景の色を差し引く）: 画素を「背景の色と被写体の色の混ざり」とみて、被写体の色を求める。
+//   全体の推定: w = max(min(d, 1), a) として、背景の量 1 - w のキーの色を引き、w で割る（キーと灰色の混ざりならちょうど元の灰色。
+//   不透明（a = 1）の所は変えない）。
+//   柔らかさが 0 でなければ、さらに周り（8 方向に 1, 2, 3, 5, 8 画素の 40 か所）に、はっきりした背景（d < 許容）と
+//   はっきりした被写体（d ≥ 許容 + 柔らかさ）の画素があるとき、いちばんはっきりした背景の色と、画素の色をいちばんよく説明する
+//   被写体の色を結ぶ線に画素の色を射影して、混ざり具合 t を求める（線から離れていれば使わない。しま模様のような被写体でも、
+//   その縁で混ざっている色を選ぶ）。キー = (t - 0.05) / 0.9 を 0..1 に切ったもの。
+//   キーが下がるときだけ使う。赤や肌のように d が 1 を超える被写体の縁も、半透明の被写体の色になる（灰色やオリーブ色の線が残らない）。
+// - キーの色が灰色に近い（鮮やかさ 0.01 未満）ときは何もしない（抜かない・こぼれも取らない。明るさで抜くなら lumakey）。
+// - 色のこぼれの除去（縁の色を戻した後の色に掛ける）: キーの色のいちばん強い成分（緑の布なら G）を下げる。
+//   spill 0..1: G' = G - spill × max(G - max(R, B), 0)。黄色（R = G）や水色（B = G）は変わらない。
+//   spill 1..2: 上限を max(R, B) から (R + B) / 2 へ近づける（2 で G' = min(G, (R + B) / 2)。青緑に寄らないが、黄色・水色も少し変わる）。
+//   下げた分の明るさは灰色で足し戻す（被写体の明るさが変わらない）。
+// - エッジ: キー a に、収縮（正方形の窓の最小 / 負なら最大）→ ぼかし（箱ぼかし 2 回。ガウスに近い）の順に掛ける。
+//   半径が CKEY_LINE_MIN を超えたら、行（列）ごとに 1 つの実行が窓を滑らせる（手間が半径によらない。最小・最大は van Herk の方法）。
+//   掛けるのはキーだけで、元のアルファには掛けない。マスク（ガーベッジマット）は後ろに書く（docs/keying.md）。
+// - 帯に分けない宣言（@whole）は、生成器（tools/gen-plugins.mjs）が読めるようになってから足す（wasm 版で帯の境目がずれないように）。
+//
+// 作業: tmp に (色, d) を書き、それを読んで層に書く（kernel 2 つ）。収縮・ぼかしがあるときは、キーを f32 の Buffer 2 つで行き来させる。
+
+// 縁の推定で周りを見る所: 8 方向に、1, 2, 3, 5, 8 画素の所（40 か所。幅 10 画素ほどの柔らかい縁まで届く）。
+const CKEY_STEPS: i32 = 5;
+const CKEY_LINE_MIN: i32 = 8;
+
+// BT.709 の色の平面の位置（Cb, Cr）。
+kernel function ckeyChroma(r: f32, g: f32, b: f32): vec2<f32> {
+  const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  return vec2((b - y) / 1.8556, (r - y) / 1.5748);
+}
+
+// キーの色の鮮やかさ（0.01 未満なら灰色のキー）。
+kernel function ckeyKeySat(p: f32[8]): f32 {
+  const k = ckeyChroma(p[5], p[6], p[7]);
+  return Math.sqrt(k.x * k.x + k.y * k.y);
+}
+
+// 画素 c のキーの色からの距離 d（0 以上）。元のアルファが 0 か、キーの色が灰色なら -1（キーに関わらない）。
+kernel function ckeyDist(c: vec4<f32>, p: f32[8]): f32 {
+  if (c.w <= 0.0) {
+    return -1.0;
+  }
+  const k = ckeyChroma(p[5], p[6], p[7]);
+  const km = Math.sqrt(k.x * k.x + k.y * k.y);
+  if (km < 0.01) {
+    return -1.0;
+  }
+  const q = ckeyChroma(c.x, c.y, c.z);
+  const dx = q.x - k.x;
+  const dy = q.y - k.y;
+  return Math.sqrt(dx * dx + dy * dy) / km;
+}
+
+// 距離 d からのキー（直線。柔らかさ 0 なら 0 か 1）。
+kernel function ckeyRamp(d: f32, p: f32[8]): f32 {
+  if (d < 0.0) {
+    return 1.0;
+  }
+  if (p[1] <= 0.0) {
+    if (d > p[0]) {
+      return 1.0;
+    }
+    return 0.0;
+  }
+  return Math.min(Math.max((d - p[0]) / p[1], 0.0), 1.0);
+}
+
+// tmp[i] = (色, d)。
+export kernel function ckeyPrep(i: u32, tmp: mut Buffer<vec4<f32>>, layer: Buffer<vec4<f32>>, p: f32[8]): void {
+  const c = layer[i];
+  tmp[i] = vec4(c.x, c.y, c.z, ckeyDist(c, p));
+}
+
+// 縁の推定で見る k 番目（0..39）の所の画素の番号。層の外なら -1。1, 2, 3, 5, 8 画素の距離ごとに 8 方向。
+kernel function ckeySample(x: i32, y: i32, w: u32, h: u32, k: i32): i32 {
+  const st = k >> 3;
+  const dir = k & 7;
+  let dist = st + 1;
+  if (st >= 3) {
+    dist = 3 * st - 4;
+  }
+  let ux = 0;
+  let uy = 0;
+  if (dir == 0 || dir == 1 || dir == 7) {
+    ux = dist;
+  } else if (dir >= 3 && dir <= 5) {
+    ux = -dist;
+  }
+  if (dir >= 1 && dir <= 3) {
+    uy = dist;
+  } else if (dir >= 5) {
+    uy = -dist;
+  }
+  const xx = x + ux;
+  const yy = y + uy;
+  if (xx < 0 || xx >= (w as i32) || yy < 0 || yy >= (h as i32)) {
+    return -1;
+  }
+  return yy * (w as i32) + xx;
+}
+
+// 画素 i の被写体の色（縁の背景の色を差し引いた色）とキー。tmp は ckeyPrep の (色, d)。
+kernel function ckeySolve(i: u32, tmp: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): vec4<f32> {
+  const s = tmp[i];
+  const d = s.w;
+  if (d < 0.0) {
+    return vec4(s.x, s.y, s.z, 1.0);
+  }
+  let a = ckeyRamp(d, p);
+  // 全体の推定: 背景の量 min(1 - min(d, 1), 1 - a) のキーの色を引き、残りの量で割る（不透明な所は変えない）
+  const ar = Math.min(d, 1.0);
+  const wt = Math.max(ar, a);
+  const bgk = 1.0 - wt;
+  let fr = s.x;
+  let fg = s.y;
+  let fb = s.z;
+  if (wt > 0.0) {
+    fr = (s.x - bgk * p[5]) / wt;
+    fg = (s.y - bgk * p[6]) / wt;
+    fb = (s.z - bgk * p[7]) / wt;
+  }
+  // 周りの推定: いちばんはっきりした背景の色と、はっきりした被写体の色のうち画素の色をいちばんよく説明するもの
+  // （2 つを結ぶ線に乗り、より純粋なもの）を選び、その線に画素の色を射影して混ざり具合 t を求める
+  const lo = p[0];
+  const hi = p[0] + p[1];
+  if (p[1] > 0.0 && d >= lo) {
+    const px = (i % w) as i32;
+    const py = (i / w) as i32;
+    let jb: i32 = -1;
+    let db = 0.0;
+    for (let k = 0; k < 8 * CKEY_STEPS; k++) {
+      const j = ckeySample(px, py, w, h, k);
+      if (j >= 0) {
+        const dj = tmp[j as u32].w;
+        if (dj >= 0.0 && dj < lo && (jb < 0 || dj < db)) {
+          jb = j;
+          db = dj;
+        }
+      }
+    }
+    if (jb >= 0) {
+      const cb = tmp[jb as u32];
+      const ex = s.x - cb.x;
+      const ey = s.y - cb.y;
+      const ez = s.z - cb.z;
+      let best = 1000.0;
+      let bt = 2.0;
+      for (let k = 0; k < 8 * CKEY_STEPS; k++) {
+        const j = ckeySample(px, py, w, h, k);
+        if (j >= 0) {
+          const cf = tmp[j as u32];
+          if (cf.w >= hi) {
+            const vx = cf.x - cb.x;
+            const vy = cf.y - cb.y;
+            const vz = cf.z - cb.z;
+            const l2 = vx * vx + vy * vy + vz * vz;
+            if (l2 > 0.0001) {
+              const t = (ex * vx + ey * vy + ez * vz) / l2;
+              const rx = ex - t * vx;
+              const ry = ey - t * vy;
+              const rz = ez - t * vz;
+              const rr = (rx * rx + ry * ry + rz * rz) / l2;
+              // 線に乗っている（離れが線の長さの 2 割まで）もののうち、t が小さい（より純粋な被写体の色）ものを選ぶ
+              const score = rr + 0.05 * Math.max(t, 0.0);
+              if (rr <= 0.04 && score < best) {
+                best = score;
+                bt = t;
+              }
+            }
+          }
+        }
+      }
+      if (bt < 1.0) {
+        const tl = Math.min(Math.max((bt - 0.05) / 0.9, 0.0), 1.0);
+        if (tl < a) {
+          a = tl;
+          const tt = Math.max(bt, 0.05);
+          fr = cb.x + ex / tt;
+          fg = cb.y + ey / tt;
+          fb = cb.z + ez / tt;
+        }
+      }
+    }
+  }
+  return vec4(Math.min(Math.max(fr, 0.0), 1.0), Math.min(Math.max(fg, 0.0), 1.0), Math.min(Math.max(fb, 0.0), 1.0), a);
+}
+
+// 色のこぼれを取る（キーの色が灰色なら何もしない）。
+kernel function ckeySpill(f: vec4<f32>, p: f32[8]): vec4<f32> {
+  let r = f.x;
+  let g = f.y;
+  let b = f.z;
+  const s = Math.min(Math.max(p[2], 0.0), 2.0);
+  if (s > 0.0 && ckeyKeySat(p) >= 0.01) {
+    let ex = 0.0;
+    let wl = 0.0;
+    const bias = Math.max(s - 1.0, 0.0);
+    const amt = Math.min(s, 1.0);
+    if (p[6] >= p[5] && p[6] >= p[7]) {
+      const lim = Math.max(r, b) + (0.5 * (r + b) - Math.max(r, b)) * bias;
+      ex = Math.max(g - lim, 0.0) * amt;
+      g = g - ex;
+      wl = 0.7152;
+    } else if (p[7] >= p[5]) {
+      const lim = Math.max(r, g) + (0.5 * (r + g) - Math.max(r, g)) * bias;
+      ex = Math.max(b - lim, 0.0) * amt;
+      b = b - ex;
+      wl = 0.0722;
+    } else {
+      const lim = Math.max(g, b) + (0.5 * (g + b) - Math.max(g, b)) * bias;
+      ex = Math.max(r - lim, 0.0) * amt;
+      r = r - ex;
+      wl = 0.2126;
+    }
+    const back = ex * wl;
+    r = r + back;
+    g = g + back;
+    b = b + back;
+  }
+  return vec4(Math.min(Math.max(r, 0.0), 1.0), Math.min(Math.max(g, 0.0), 1.0), Math.min(Math.max(b, 0.0), 1.0), f.w);
+}
+
+// 収縮・ぼかしがないとき: 仕上げる。
+export kernel function ckeyDirect(i: u32, layer: mut Buffer<vec4<f32>>, tmp: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const c = layer[i];
+  const f = ckeySpill(ckeySolve(i, tmp, w, h, p), p);
+  layer[i] = vec4(f.x, f.y, f.z, Math.min(Math.max(c.w * f.w, 0.0), 1.0));
+}
+
+// 収縮・ぼかしの前: キーを m に、こぼれを取った色（アルファは元のまま）を層に書く。
+export kernel function ckeySplit(
+  i: u32, m: mut Buffer<f32>, layer: mut Buffer<vec4<f32>>, tmp: Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8],
+): void {
+  const c = layer[i];
+  const f = ckeySpill(ckeySolve(i, tmp, w, h, p), p);
+  m[i] = f.w;
+  layer[i] = vec4(f.x, f.y, f.z, c.w);
+}
+
+// キー src を横（vertical = 0）か縦（1）に、窓 2r+1 で処理して dst に書く（画素ごと。小さい半径用）。
+// op: 0 = 最小（収縮）、1 = 最大（広げる）、2 = 平均（ぼかし）。端は端の画素をくり返す。
+export kernel function ckeyEdge(
+  i: u32, dst: mut Buffer<f32>, src: Buffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32,
+): void {
+  let pos = (i % w) as i32;
+  let last = (w as i32) - 1;
+  let base = i - (pos as u32);
+  let step: u32 = 1;
+  if (vertical != 0) {
+    pos = (i / w) as i32;
+    last = (h as i32) - 1;
+    base = i % w;
+    step = w;
+  }
+  let acc = 0.0;
+  if (op == 0) {
+    acc = 1.0;
+  }
+  for (let k = -r; k <= r; k++) {
+    const q = Math.min(Math.max(pos + k, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (op == 0) {
+      acc = Math.min(acc, v);
+    } else if (op == 1) {
+      acc = Math.max(acc, v);
+    } else {
+      acc = acc + v;
+    }
+  }
+  if (op == 2) {
+    acc = acc / ((2 * r + 1) as f32);
+  }
+  dst[i] = acc;
+}
+
+// 線 li（横なら行、縦なら列）を窓 2r+1 で処理して work[画素の番号] に書く（1 本につき 1 つの実行。大きい半径用）。
+// 平均は窓を滑らせる（入る値を足し、出る値を引く）。最小・最大は van Herk の方法: 端を r ずつくり返して伸ばした線を
+// 長さ 2r+1 の区切りに分け、区切りの頭からの累積（g）と尻からの累積（hh）を work の後ろ（at から）に書き、
+// 窓 [x, x+2r]（伸ばした線の位置）の値を op(hh[x], g[x+2r]) で求める。1 画素あたりの手間は半径によらない。
+export kernel function ckeyLines(
+  li: u32, work: mut RacyBuffer<f32>, src: Buffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32, at: u32,
+): void {
+  let base = li * w;
+  let step: u32 = 1;
+  let n = w;
+  if (vertical != 0) {
+    base = li;
+    step = w;
+    n = h;
+  }
+  const last = (n as i32) - 1;
+  if (op == 2) {
+    const inv = 1.0 / ((2 * r + 1) as f32);
+    let acc = 0.0;
+    for (let k = -r; k <= r; k++) {
+      const kk = Math.min(Math.max(k, 0), last);
+      acc = acc + src[base + (kk as u32) * step];
+    }
+    for (let x = 0; x <= last; x++) {
+      work[base + (x as u32) * step] = acc * inv;
+      const xin = Math.min(x + r + 1, last);
+      const xout = Math.max(x - r, 0);
+      acc = acc + src[base + (xin as u32) * step] - src[base + (xout as u32) * step];
+    }
+    return;
+  }
+  const blk = 2 * r + 1;
+  const ext = (n as i32) + 2 * r;
+  const g0 = at + li * (ext as u32) * 2;
+  const h0 = g0 + (ext as u32);
+  let acc = 0.0;
+  for (let e = 0; e < ext; e++) {
+    const q = Math.min(Math.max(e - r, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (e % blk == 0) {
+      acc = v;
+    } else if (op == 0) {
+      acc = Math.min(acc, v);
+    } else {
+      acc = Math.max(acc, v);
+    }
+    work[g0 + (e as u32)] = acc;
+  }
+  for (let e = ext - 1; e >= 0; e--) {
+    const q = Math.min(Math.max(e - r, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (e == ext - 1 || (e + 1) % blk == 0) {
+      acc = v;
+    } else if (op == 0) {
+      acc = Math.min(acc, v);
+    } else {
+      acc = Math.max(acc, v);
+    }
+    work[h0 + (e as u32)] = acc;
+  }
+  for (let x = 0; x <= last; x++) {
+    const a = work[h0 + (x as u32)];
+    const b = work[g0 + ((x + 2 * r) as u32)];
+    let v = Math.max(a, b);
+    if (op == 0) {
+      v = Math.min(a, b);
+    }
+    work[base + (x as u32) * step] = v;
+  }
+}
+
+// work の先頭（画素の番号の所）を dst に写す。
+export kernel function ckeyCopy(i: u32, dst: mut Buffer<f32>, work: RacyBuffer<f32>): void {
+  dst[i] = work[i];
+}
+
+// 仕上げ: アルファ = 元のアルファ × m のキー（色は ckeySplit で書いた）。
+export kernel function ckeyStore(i: u32, layer: mut Buffer<vec4<f32>>, m: Buffer<f32>): void {
+  const c = layer[i];
+  layer[i] = vec4(c.x, c.y, c.z, Math.min(Math.max(c.w * m[i], 0.0), 1.0));
+}
+
+// 1 方向の処理（src → dst）。半径が CKEY_LINE_MIN を超えたら線ごとに滑らせる。
+function ckeyPass(dst: mut Buffer<f32>, src: Buffer<f32>, work: mut RacyBuffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32): void {
+  if (r <= CKEY_LINE_MIN) {
+    dispatch(ckeyEdge, w * h, mut dst, src, w, h, r, vertical, op);
+    return;
+  }
+  let lines = h;
+  if (vertical != 0) {
+    lines = w;
+  }
+  dispatch(ckeyLines, lines, mut work, src, w, h, r, vertical, op, w * h);
+  dispatch(ckeyCopy, w * h, mut dst, work);
+}
+
+export function fx_chromakey(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  dispatch(ckeyPrep, n, mut tmp, layer, p);
+  const sh = Math.floor(Math.abs(p[3]) + 0.5) as i32;
+  const fe = Math.floor(Math.max(p[4], 0.0) + 0.5) as i32;
+  if (sh == 0 && fe == 0) {
+    dispatch(ckeyDirect, n, mut layer, tmp, w, h, p);
+    return;
+  }
+  // キーの作業用（f32 を 2 つ）。大きい半径の線ごとの処理は RacyBuffer に書く（van Herk の累積の分も後ろに取る）
+  let m = new Buffer<f32>(n);
+  let m2 = new Buffer<f32>(n);
+  const rmax = Math.max(sh, fe);
+  let wn: u32 = 1;
+  if (rmax > CKEY_LINE_MIN) {
+    const rr = rmax as u32;
+    wn = n + 2 * Math.max((w + 2 * rr) * h, (h + 2 * rr) * w);
+  }
+  let work = new RacyBuffer<f32>(wn);
+  dispatch(ckeySplit, n, mut m, mut layer, tmp, w, h, p);
+  if (sh > 0) {
+    let op: u32 = 0;
+    if (p[3] < 0.0) {
+      op = 1;
+    }
+    ckeyPass(mut m2, m, mut work, w, h, sh, 0, op);
+    ckeyPass(mut m, m2, mut work, w, h, sh, 1, op);
+  }
+  for (let pass = 0; pass < 2 && fe > 0; pass++) {
+    ckeyPass(mut m2, m, mut work, w, h, fe, 0, 2);
+    ckeyPass(mut m, m2, mut work, w, h, fe, 1, 2);
+  }
+  dispatch(ckeyStore, n, mut layer, m);
+}

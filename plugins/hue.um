@@ -1,0 +1,70 @@
+// @effect hue "色相を回す（RGB を YCbCr の色平面で回転する）"
+// @label "色相回転"
+// @category color
+// @param angle 30 -180..180 "色相の角度（度。0 で何もしない、180 で反対の色）"
+// @gpu 1
+
+// 小さい範囲に畳んだ角度の sin / cos（テイラー展開）。
+kernel function hueSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function hueCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return hueSin(x + 0.5 * PI);
+}
+
+export kernel function fx_gpu_hue(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  if (p[0] == 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const rad = p[0] * 0.0174532925;
+  const sn = hueSin(rad);
+  const cs = hueCos(rad);
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const cb = (c.z - y) / 1.8556;
+  const cr = (c.x - y) / 1.5748;
+  const cb2 = cb * cs - cr * sn;
+  const cr2 = cb * sn + cr * cs;
+  const r = y + 1.5748 * cr2;
+  const g = y - 0.187324 * cb2 - 0.468124 * cr2;
+  const b = y + 1.8556 * cb2;
+  dst[i] = vec4(
+    Math.min(Math.max(r, 0.0), 1.0),
+    Math.min(Math.max(g, 0.0), 1.0),
+    Math.min(Math.max(b, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function hueCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_hue(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_hue, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(hueCopy, n, mut layer, tmp);
+}

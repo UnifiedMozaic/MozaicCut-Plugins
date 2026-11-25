@@ -1,0 +1,47 @@
+// @effect duotone "デュオトーン（暗い所と明るい所を 2 つの色で塗り分ける）"
+// @label "デュオトーン"
+// @category color
+// @param amount 1 0..1 "混ぜる強さ（0 で元の色、1 で完全に 2 色）"
+// @param shadow_r 0.08 0..1 "暗い所の赤"
+// @param shadow_g 0.05 0..1 "暗い所の緑"
+// @param shadow_b 0.25 0..1 "暗い所の青"
+// @param high_r 1.0 0..1 "明るい所の赤"
+// @param high_g 0.78 0..1 "明るい所の緑"
+// @param high_b 0.35 0..1 "明るい所の青"
+// @gpu 1
+
+export kernel function fx_gpu_duotone(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  if (a <= 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const y = Math.min(Math.max(0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z, 0.0), 1.0);
+  const t = y * y * (3.0 - 2.0 * y);
+  const dr = p[1] + (p[4] - p[1]) * t;
+  const dg = p[2] + (p[5] - p[2]) * t;
+  const db = p[3] + (p[6] - p[3]) * t;
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + (dr - c.x) * a, 0.0), 1.0),
+    Math.min(Math.max(c.y + (dg - c.y) * a, 0.0), 1.0),
+    Math.min(Math.max(c.z + (db - c.z) * a, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function duotoneCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_duotone(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_duotone, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(duotoneCopy, n, mut layer, tmp);
+}

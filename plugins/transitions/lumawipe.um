@@ -1,0 +1,40 @@
+// @transition lumawipe "前の映像の暗い所から先に次の映像へ切り替わる（trans.param=1 で明るい所から）"
+// @label "ルミナンスワイプ"
+//
+// 前の映像の明るさを、切り替わる順番に使う。境目は trans.soft でぼかす（0 に近いと切り絵のようにくっきり）。
+
+export kernel function tr_gpu_lumawipe(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const ca = a[i];
+  const cb = b[i];
+  let y = Math.min(Math.max(0.2126 * ca.x + 0.7152 * ca.y + 0.0722 * ca.z, 0.0), 1.0);
+  if (param >= 0.5) {
+    y = 1.0 - y;
+  }
+  const s = Math.max(soft, 0.002);
+  const edge = p * (1.0 + s) - s * 0.5;
+  const t = Math.min(Math.max((edge - y + s * 0.5) / s, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trLumawipeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_lumawipe(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_lumawipe, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trLumawipeCopy, n, mut a, tmp);
+}

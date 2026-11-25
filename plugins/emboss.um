@@ -1,0 +1,54 @@
+// @effect emboss "浮き彫りにする（斜めの光で凹凸を付ける）"
+// @label "エンボス"
+// @category style
+// @param strength 1.5 0..4 "凹凸の深さ（0 で何もしない）"
+// @param mix 0.5 0..1 "灰色の浮き彫りにする割合（0 で元の色に陰影を足し、1 で石膏のような灰色の浮き彫り）"
+// @reach strength 1
+// @gpu 1
+
+kernel function embossCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_emboss(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const str = p[0];
+  if (str <= 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const mix = p[1];
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const maxX = (w as i32) - 1;
+  const maxY = (h as i32) - 1;
+  const x0 = Math.max(x - 1, 0) as u32;
+  const y0 = Math.max(y - 1, 0) as u32;
+  const x1 = Math.min(x + 1, maxX) as u32;
+  const y1 = Math.min(y + 1, maxY) as u32;
+  const c0 = src[y0 * w + x0];
+  const c1 = src[y1 * w + x1];
+  const c = src[i];
+  const d = ((0.2126 * (c1.x - c0.x) + 0.7152 * (c1.y - c0.y) + 0.0722 * (c1.z - c0.z)) * str);
+  const gray = Math.min(Math.max(0.5 + d, 0.0), 1.0);
+  const colR = Math.min(Math.max(c.x + d, 0.0), 1.0);
+  const colG = Math.min(Math.max(c.y + d, 0.0), 1.0);
+  const colB = Math.min(Math.max(c.z + d, 0.0), 1.0);
+  dst[i] = vec4(
+    colR + (gray - colR) * mix,
+    colG + (gray - colG) * mix,
+    colB + (gray - colB) * mix,
+    c.w,
+  );
+}
+
+export function fx_emboss(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_emboss, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(embossCopy, n, mut layer, tmp);
+}

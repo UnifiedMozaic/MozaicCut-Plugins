@@ -1,0 +1,34 @@
+// @effect sepia "セピア調にする"
+// @label "セピア"
+// @category color
+// @param amount 1 0..1 "強さ（1 で完全なセピア、0 でそのまま）"
+// @gpu 1
+//
+// 色の効果なので、アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_sepia(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  const sr = 0.393 * c.x + 0.769 * c.y + 0.189 * c.z;
+  const sg = 0.349 * c.x + 0.686 * c.y + 0.168 * c.z;
+  const sb = 0.272 * c.x + 0.534 * c.y + 0.131 * c.z;
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + (sr - c.x) * a, 0.0), 1.0),
+    Math.min(Math.max(c.y + (sg - c.y) * a, 0.0), 1.0),
+    Math.min(Math.max(c.z + (sb - c.z) * a, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function sepiaCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_sepia(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_sepia, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(sepiaCopy, n, mut layer, tmp);
+}

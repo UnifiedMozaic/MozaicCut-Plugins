@@ -1,0 +1,60 @@
+// @effect wave "波のように揺らす（水面・陽炎のような歪み）"
+// @label "波形ワープ"
+// @category style
+// @thumb 0=3 1=14
+// @param amplitude 10 0..128 "揺れの幅（画素。0 で何もしない）"
+// @param wavelength 48 8..512 "波の周期（画素）"
+// @param phase 0 -360..360 "波の位相（度。キーフレームで動かすと波が流れる）"
+// @whole
+// @gpu 1
+
+kernel function waveSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function waveCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_wave(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const amp = p[0];
+  if (amp == 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const freq = 6.2831853 / Math.max(p[1], 4.0);
+  const ph = p[2] * 0.0174532925;
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  const maxX = (w as i32) - 1;
+  const maxY = (h as i32) - 1;
+  const sx = Math.min(Math.max(Math.floor(x + waveSin(y * freq + ph) * amp + 0.5) as i32, 0), maxX) as u32;
+  const sy = Math.min(Math.max(Math.floor(y + waveSin(x * freq + ph * 1.3) * amp * 0.35 + 0.5) as i32, 0), maxY) as u32;
+  dst[i] = src[sy * w + sx];
+}
+
+export function fx_wave(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_wave, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(waveCopy, n, mut layer, tmp);
+}

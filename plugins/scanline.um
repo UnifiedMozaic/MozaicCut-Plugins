@@ -1,0 +1,41 @@
+// @effect scanline "走査線を入れる（ブラウン管・レトロモニター風の横縞）"
+// @label "走査線"
+// @category style
+// @thumb 1=2
+// @param strength 0.45 0..1 "縞の暗さ（0 で何もしない、1 で暗い線が黒くなる）"
+// @param pitch 4 2..32 "縞の周期（画素。小数は四捨五入）"
+// @whole
+// @gpu 1
+
+export kernel function fx_gpu_scanline(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const str = p[0];
+  if (str <= 0.0 || w == 0) {
+    dst[i] = c;
+    return;
+  }
+  const pitch = Math.max(Math.floor(p[1] + 0.5) as i32, 2) as u32;
+  const y = i / w;
+  const rem = y % pitch;
+  let k = 1.0;
+  if (rem * 2 >= pitch) {
+    k = 1.0 - str;
+  }
+  dst[i] = vec4(c.x * k, c.y * k, c.z * k, c.w);
+}
+
+kernel function scanlineCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_scanline(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_scanline, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(scanlineCopy, n, mut layer, tmp);
+}

@@ -1,0 +1,43 @@
+// @transition diamond "画面の中央からひし形に広がって次の映像を出す"
+// @label "ダイヤモンド（ひし形拡大）"
+//
+// 中心からの距離を |dx| + |dy|（縦横比を合わせる）で測り、iris と同じように境目を trans.soft でぼかす。
+
+export kernel function tr_gpu_diamond(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const wf = w as f32;
+  const hf = h as f32;
+  const aspect = wf / Math.max(hf, 1.0);
+  const dx = Math.abs((((i % w) as f32 + 0.5) / wf - 0.5) * aspect);
+  const dy = Math.abs(((i / w) as f32 + 0.5) / hf - 0.5);
+  const dist = dx + dy;
+  const maxR = 0.5 * aspect + 0.5;
+  const s = Math.max(soft, 0.002) * maxR;
+  const rad = p * (maxR + s) - s * 0.5;
+  const t = Math.min(Math.max((rad - dist + s * 0.5) / s, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[i];
+  const cb = b[i];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trDiamondCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_diamond(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_diamond, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trDiamondCopy, n, mut a, tmp);
+}

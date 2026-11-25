@@ -1,0 +1,56 @@
+// @transition checker "画面をマス目に分け、マスごとにばらばらの順で次の映像へ入れ替える"
+// @label "チェッカー（マス目）"
+//
+// trans.param は横のマスの数（0 以下なら 10）。縦のマスの数は、マスが正方形に近くなるように決める。
+// マスごとに乱数で始まりをずらし（0..0.6）、各マスは進行度 0.4 の間に溶けるように入れ替わる。trans.soft は使わない。
+
+kernel function trCheckerHash(n0: u32): f32 {
+  let n = n0;
+  n = (n ^ 61) ^ (n >> 16);
+  n = n + (n << 3);
+  n = n ^ (n >> 4);
+  n = n * 668265261;
+  n = n ^ (n >> 15);
+  return ((n & 65535) as f32) / 65535.0;
+}
+
+export kernel function tr_gpu_checker(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const wf = w as f32;
+  const hf = h as f32;
+  let nx = Math.floor(param + 0.5);
+  if (nx < 1.0) {
+    nx = 10.0;
+  }
+  nx = Math.min(nx, 200.0);
+  const ny = Math.max(Math.floor(nx * hf / Math.max(wf, 1.0) + 0.5), 1.0);
+  const cx = Math.min(Math.floor(((i % w) as f32) * nx / wf), nx - 1.0) as u32;
+  const cy = Math.min(Math.floor(((i / w) as f32) * ny / hf), ny - 1.0) as u32;
+  const start = trCheckerHash(cy * 977 + cx * 131 + 7) * 0.6;
+  const t = Math.min(Math.max((p - start) / 0.4, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[i];
+  const cb = b[i];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trCheckerCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_checker(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_checker, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trCheckerCopy, n, mut a, tmp);
+}

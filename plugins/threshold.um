@@ -1,0 +1,36 @@
+// @effect threshold "2 値化する（明るさの境目で白と黒に分ける）"
+// @label "2 値化"
+// @category color
+// @param cutoff 0.5 0..1 "白と黒に分ける明るさの境目"
+// @param softness 0.05 0..0.5 "境目の柔らかさ（0 でくっきり 2 値）"
+// @gpu 1
+
+export kernel function fx_gpu_threshold(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const cut = p[0];
+  const soft = p[1];
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  let v = 0.0;
+  if (soft <= 0.0) {
+    if (y >= cut) {
+      v = 1.0;
+    }
+  } else {
+    const t = Math.min(Math.max((y - (cut - soft)) / (2.0 * soft), 0.0), 1.0);
+    v = t * t * (3.0 - 2.0 * t);
+  }
+  dst[i] = vec4(v, v, v, c.w);
+}
+
+kernel function thresholdCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_threshold(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_threshold, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(thresholdCopy, n, mut layer, tmp);
+}

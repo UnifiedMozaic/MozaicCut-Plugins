@@ -1,0 +1,97 @@
+// @effect swirl "渦（中心のまわりをねじって、渦巻きのようにゆがめる）"
+// @label "渦"
+// @category style
+// @init 180
+// @param angle 0 -720..720 "ねじる角度（度。中心でいちばん回り、半径の外では回らない。0 で何もしない）"
+// @param radius 0.5 0.05..2 "効く半径（層の短い辺を 1 とする）"
+// @param cx 0.5 0..1 "中心の横の位置（層の左端 0、右端 1）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の上端 0、下端 1）"
+// @whole
+// @gpu 1
+//
+// 中心からの距離 d が半径より内側の画素を、(1 - d / 半径)² × angle だけ回した所から取る（双線形補間）。
+// 層の外を指したら、いちばん近い端の画素を使う。
+
+kernel function swirlSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function swirlTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const cx = Math.min(Math.max(x, 0), (w as i32) - 1) as u32;
+  const cy = Math.min(Math.max(y, 0), (h as i32) - 1) as u32;
+  return src[cy * w + cx];
+}
+
+kernel function swirlSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x = fx - 0.5;
+  const y = fy - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = swirlTexel(src, ix, iy, w, h);
+  const b = swirlTexel(src, ix + 1, iy, w, h);
+  const c = swirlTexel(src, ix, iy + 1, w, h);
+  const d = swirlTexel(src, ix + 1, iy + 1, w, h);
+  const top = a + (b - a) * tx;
+  const bot = c + (d - c) * tx;
+  return top + (bot - top) * ty;
+}
+
+export kernel function fx_gpu_swirl(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  if (p[0] == 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const wf = w as f32;
+  const hf = h as f32;
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const ox = p[2] * wf;
+  const oy = p[3] * hf;
+  const dx = px - ox;
+  const dy = py - oy;
+  const rad = Math.max(p[1], 0.01) * Math.min(wf, hf);
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d >= rad) {
+    dst[i] = src[i];
+    return;
+  }
+  const u = 1.0 - d / rad;
+  const th = p[0] * 0.0174532925 * u * u;
+  const s = swirlSin(th);
+  const c = swirlSin(th + 1.5707963);
+  dst[i] = swirlSample(src, ox + dx * c - dy * s, oy + dx * s + dy * c, w, h);
+}
+
+kernel function swirlCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_swirl(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_swirl, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(swirlCopy, n, mut layer, tmp);
+}

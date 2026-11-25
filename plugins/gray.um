@@ -1,0 +1,33 @@
+// @effect gray "白黒にする（彩度を 1 - amount にする）"
+// @label "白黒"
+// @category color
+// @param amount 1 0..1 "強さ（1 で完全な白黒、0 でそのまま）"
+// @alias grey
+// @gpu 1
+//
+// 輝度は BT.709。色の効果なので、アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_gray(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const s = 1.0 - p[0];
+  const l = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  dst[i] = vec4(
+    Math.min(Math.max(l + (c.x - l) * s, 0.0), 1.0),
+    Math.min(Math.max(l + (c.y - l) * s, 0.0), 1.0),
+    Math.min(Math.max(l + (c.z - l) * s, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function grayCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_gray(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_gray, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(grayCopy, n, mut layer, tmp);
+}

@@ -1,0 +1,61 @@
+// @effect lightleak "光漏れ（フィルムに漏れた光のような、暖かいにじみを端から重ねる）"
+// @label "光漏れ"
+// @category style
+// @init 0.6
+// @param amount 0 0..1 "光の強さ（0 で何もしない）"
+// @param x 0.9 -0.5..1.5 "光の中心の横の位置（層の左端 0、右端 1）"
+// @param y 0.1 -0.5..1.5 "光の中心の縦の位置（層の上端 0、下端 1）"
+// @param radius 0.8 0.05..3 "光の広がり（層の高さを 1 とする）"
+// @param r 1.0 0..1 "光の色の赤"
+// @param g 0.5 0..1 "光の色の緑"
+// @param b 0.2 0..1 "光の色の青"
+// @whole
+// @gpu 1
+//
+// スクリーン合成（1 - (1 - 元) × (1 - 光)）で明るくするだけなので、白は白のまま。広がりは縦横比を保った円で、
+// 中心から radius で 0 になるまでなめらかに弱まる。透明な所は光らせない（アルファで掛ける）。アルファは変えない。
+// 位置を x / y にキーフレームで動かすと、光が流れる。
+
+export kernel function fx_gpu_lightleak(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = Math.min(Math.max(p[0], 0.0), 1.0);
+  if (a <= 0.0 || w == 0 || h == 0) {
+    dst[i] = c;
+    return;
+  }
+  const hf = h as f32;
+  const px = (((i % w) as f32) + 0.5) / hf;
+  const py = (((i / w) as f32) + 0.5) / hf;
+  const cx = p[1] * (w as f32) / hf;
+  const cy = p[2];
+  const dx = px - cx;
+  const dy = py - cy;
+  const d = Math.sqrt(dx * dx + dy * dy) / Math.max(p[3], 0.01);
+  const t = Math.min(Math.max(1.0 - d, 0.0), 1.0);
+  const k = t * t * (3.0 - 2.0 * t) * a * c.w;
+  const lr = Math.min(Math.max(p[4], 0.0), 1.0) * k;
+  const lg = Math.min(Math.max(p[5], 0.0), 1.0) * k;
+  const lb = Math.min(Math.max(p[6], 0.0), 1.0) * k;
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + (c.w - c.x) * lr, 0.0), 1.0),
+    Math.min(Math.max(c.y + (c.w - c.y) * lg, 0.0), 1.0),
+    Math.min(Math.max(c.z + (c.w - c.z) * lb, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function lightleakCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_lightleak(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_lightleak, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(lightleakCopy, n, mut layer, tmp);
+}

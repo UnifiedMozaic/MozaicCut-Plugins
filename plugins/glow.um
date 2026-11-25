@@ -1,0 +1,81 @@
+// @effect glow "明るい部分をふんわり発光させる（ブルーム）"
+// @label "グロー（発光）"
+// @category blur
+// @thumb 1=2
+// @param amount 0.6 0..2 "発光の強さ（0 で何もしない）"
+// @param radius 6 1..24 "光の広がりの半径（画素。小数は四捨五入）"
+// @param cutoff 0.45 0..0.95 "発光が始まる明るさの境目"
+// @alias bloom
+// @reach radius 1 round
+// @gpu 2
+
+// pass 0: 境目より明るい部分を取り出してプリマルチプライで横方向に箱ぼかし。
+// pass 1: 横の結果を縦に平均し、orig（元の層）へ加算して重ねる（透明な周りにも光が漏れる）。
+export kernel function fx_gpu_glow(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const amt = p[0];
+  if (amt <= 0.0 || w == 0 || h == 0) {
+    dst[i] = orig[i];
+    return;
+  }
+  const r = Math.max(Math.floor(p[1] + 0.5) as i32, 1);
+  const inv = 1.0 / ((2 * r + 1) as f32);
+  if (pass == 0) {
+    const x = (i % w) as i32;
+    const row = i - (x as u32);
+    const last = (w as i32) - 1;
+    const cut = p[2];
+    const span = Math.max(1.0 - cut, 0.01);
+    let acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (let k = -r; k <= r; k++) {
+      const xx = Math.min(Math.max(x + k, 0), last);
+      const c = src[row + (xx as u32)];
+      const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+      const m = Math.max((y - cut) / span, 0.0) * c.w;
+      acc = acc + vec4(c.x * m, c.y * m, c.z * m, m);
+    }
+    dst[i] = acc * inv;
+    return;
+  }
+  const x = i % w;
+  const y = (i / w) as i32;
+  const last = (h as i32) - 1;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const yy = Math.min(Math.max(y + k, 0), last);
+    acc = acc + src[(yy as u32) * w + x];
+  }
+  const g = acc * (inv * amt);
+  const c = orig[i];
+  const baseR = c.x * c.w + g.x;
+  const baseG = c.y * c.w + g.y;
+  const baseB = c.z * c.w + g.z;
+  const outA = Math.min(Math.max(c.w + g.w * (1.0 - c.w), 0.0), 1.0);
+  if (outA <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  dst[i] = vec4(
+    Math.min(Math.max(baseR / outA, 0.0), 1.0),
+    Math.min(Math.max(baseG / outA, 0.0), 1.0),
+    Math.min(Math.max(baseB / outA, 0.0), 1.0),
+    outA,
+  );
+}
+
+kernel function glowCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_glow(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  let orig = new Buffer<vec4<f32>>(n);
+  dispatch(glowCopy, n, mut orig, layer);
+  dispatch(fx_gpu_glow, n, mut tmp, orig, orig, w, h, p, 0 as u32);
+  dispatch(fx_gpu_glow, n, mut layer, tmp, orig, w, h, p, 1 as u32);
+}

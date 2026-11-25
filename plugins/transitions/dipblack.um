@@ -1,0 +1,37 @@
+// @transition dipblack "一度黒に落としてから次の映像を出す"
+// @label "黒フェード（ディップ）"
+
+export kernel function tr_gpu_dipblack(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  if (p < 0.5) {
+    const t = p * 2.0;
+    const ca = a[i];
+    const q = 1.0 - t;
+    dst[i] = vec4(ca.x * q, ca.y * q, ca.z * q, Math.max(ca.w, t));
+  } else {
+    const t = (p - 0.5) * 2.0;
+    const cb = b[i];
+    const q = 1.0 - t;
+    dst[i] = vec4(cb.x * t, cb.y * t, cb.z * t, Math.max(cb.w, q));
+  }
+}
+
+kernel function trDipBlackCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_dipblack(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_dipblack, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trDipBlackCopy, n, mut a, tmp);
+}

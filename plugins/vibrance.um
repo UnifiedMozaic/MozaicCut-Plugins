@@ -1,0 +1,49 @@
+// @effect vibrance "自然な彩度（くすんだ色ほど強く、鮮やかな色や肌は控えめに色を足す）"
+// @label "自然な彩度"
+// @category color
+// @init 0.6
+// @param amount 0 -1..1 "強さ（+ で色を足し、- で色を抜く。0 で何もしない）"
+// @gpu 1
+//
+// 足すときは、もとの彩度（rgb の最大 - 最小）が低い画素ほど強く効かせ、色が飽和しにくくする。
+// 抜くときは sat と同じく一様に抜く。アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_vibrance(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  if (a == 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const mx = Math.max(Math.max(c.x, c.y), c.z);
+  const mn = Math.min(Math.min(c.x, c.y), c.z);
+  const s = Math.min(Math.max(mx - mn, 0.0), 1.0);
+  let k = a;
+  if (a > 0.0) {
+    k = a * (1.0 - s) * (1.0 - s) * 1.5;
+  }
+  const f = 1.0 + k;
+  dst[i] = vec4(
+    Math.min(Math.max(y + (c.x - y) * f, 0.0), 1.0),
+    Math.min(Math.max(y + (c.y - y) * f, 0.0), 1.0),
+    Math.min(Math.max(y + (c.z - y) * f, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function vibranceCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_vibrance(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_vibrance, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(vibranceCopy, n, mut layer, tmp);
+}

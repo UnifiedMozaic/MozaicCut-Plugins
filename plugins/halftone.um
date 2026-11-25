@@ -1,0 +1,71 @@
+// @effect halftone "網点（ハーフトーン・漫画のスクリーントーン風）にする"
+// @label "ハーフトーン（網点）"
+// @category style
+// @thumb 0=4
+// @param size 8 3..48 "網点の間隔（画素）"
+// @param contrast 0.7 0..1 "網点のはっきりさ（0 で元の絵、1 で白黒の網点）"
+// @whole
+// @gpu 1
+
+kernel function htSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function htCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return htSin(x + 0.5 * PI);
+}
+
+export kernel function fx_gpu_halftone(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const mix = p[1];
+  if (mix <= 0.0 || w == 0) {
+    dst[i] = c;
+    return;
+  }
+  const freq = 6.2831853 / Math.max(p[0], 2.0);
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  // 45 度回転させた格子で丸い網点を作る
+  const u = (x * 0.70710678 - y * 0.70710678) * freq;
+  const v = (x * 0.70710678 + y * 0.70710678) * freq;
+  const pat = (htCos(u) * htCos(v) + 1.0) * 0.5;
+  const luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const dot = Math.min(Math.max((luma - pat * 0.85) * 4.0 + 0.5, 0.0), 1.0);
+  dst[i] = vec4(
+    c.x * (1.0 - mix) + c.x * dot * mix,
+    c.y * (1.0 - mix) + c.y * dot * mix,
+    c.z * (1.0 - mix) + c.z * dot * mix,
+    c.w,
+  );
+}
+
+kernel function halftoneCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_halftone(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[1] <= 0.0 || w == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_halftone, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(halftoneCopy, n, mut layer, tmp);
+}

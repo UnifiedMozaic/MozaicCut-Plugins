@@ -1,0 +1,48 @@
+// @effect dither "ディザ（少ない色の段数を、規則的な点の並びで補って表す。昔のゲーム機・PC 風）"
+// @label "ディザ"
+// @category style
+// @param levels 4 2..16 "各色の段数（少ないほど荒い）"
+// @param amount 1 0..1 "点の並びの強さ（0 で、ただの段数落とし）"
+// @param scale 1 1..8 "点の大きさ（画素）"
+// @whole
+// @gpu 1
+//
+// 4×4 のベイヤー行列のしきい値で、段数を落とす前に色を少しずらす。並びは層の左上を起点にするので、層全体で掛ける（@whole）。
+// アルファは変えない。
+
+export kernel function fx_gpu_dither(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  if (w == 0) {
+    dst[i] = c;
+    return;
+  }
+  const lv = Math.min(Math.max(Math.floor(p[0] + 0.5), 2.0), 16.0) - 1.0;
+  const sc = Math.min(Math.max(Math.floor(p[2] + 0.5) as i32, 1), 8) as u32;
+  const x = (i % w) / sc;
+  const y = (i / w) / sc;
+  const m = (((x ^ y) & 1) << 3) | ((y & 1) << 2) | ((((x >> 1) ^ (y >> 1)) & 1) << 1) | ((y >> 1) & 1);
+  const t = ((m as f32) + 0.5) / 16.0 - 0.5;
+  const d = t * Math.min(Math.max(p[1], 0.0), 1.0);
+  dst[i] = vec4(
+    Math.min(Math.max(Math.floor(c.x * lv + 0.5 + d) / lv, 0.0), 1.0),
+    Math.min(Math.max(Math.floor(c.y * lv + 0.5 + d) / lv, 0.0), 1.0),
+    Math.min(Math.max(Math.floor(c.z * lv + 0.5 + d) / lv, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function ditherCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_dither(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_dither, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(ditherCopy, n, mut layer, tmp);
+}

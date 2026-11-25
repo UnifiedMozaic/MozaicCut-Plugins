@@ -1,0 +1,46 @@
+// @transition pixelize "モザイクを粗くしていき、いちばん粗い所で次の映像に替え、細かく戻す"
+// @label "モザイク転換"
+//
+// モザイクの大きさは進行度 0.5 でいちばん大きく、trans.param 画素（0 以下なら 48）。
+// 前と次の映像は 0.4〜0.6 の間で溶けるように入れ替える。trans.soft は使わない。
+
+export kernel function tr_gpu_pixelize(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  let mx = param;
+  if (mx <= 0.0) {
+    mx = 48.0;
+  }
+  const k = 1.0 - Math.abs(p * 2.0 - 1.0);
+  const size = Math.max(Math.floor(1.0 + (Math.min(mx, 512.0) - 1.0) * k * k + 0.5) as i32, 1) as u32;
+  const x = i % w;
+  const y = i / w;
+  const sx = Math.min((x / size) * size + size / 2, w - 1);
+  const sy = Math.min((y / size) * size + size / 2, h - 1);
+  const j = sy * w + sx;
+  const t = Math.min(Math.max((p - 0.4) / 0.2, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[j];
+  const cb = b[j];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trPixelizeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_pixelize(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_pixelize, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trPixelizeCopy, n, mut a, tmp);
+}

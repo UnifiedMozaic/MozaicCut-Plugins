@@ -1,0 +1,59 @@
+// @effect exposure "露出（カメラの段数で明るさを掛け算で変える）"
+// @label "露出"
+// @category color
+// @init 0.7
+// @param ev 0 -4..4 "露出の段数（+1 で 2 倍、-1 で半分の明るさ。0 で何もしない）"
+// @param offset 0 -0.5..0.5 "黒の持ち上げ（掛けたあとに全体へ足す量）"
+// @gpu 1
+//
+// 足し算の bright と違い、暗い所はあまり変わらず明るい所ほど大きく変わる。アルファは変えない。結果は 0..1 に収める。
+
+// 2 の x 乗（整数の部分は 2 を掛け、端数は 3 次式で近づける。端数 0 と 1 で正しい値になる）
+kernel function exposurePow2(x0: f32): f32 {
+  const x = Math.min(Math.max(x0, -8.0), 8.0);
+  const k = Math.floor(x);
+  const f = x - k;
+  let r = 1.0 + f * (0.6951786 + f * (0.2261434 + f * 0.078678));
+  let n = k as i32;
+  while (n > 0) {
+    r = r * 2.0;
+    n = n - 1;
+  }
+  while (n < 0) {
+    r = r * 0.5;
+    n = n + 1;
+  }
+  return r;
+}
+
+export kernel function fx_gpu_exposure(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  if (p[0] == 0.0 && p[1] == 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const g = exposurePow2(p[0]);
+  const o = p[1];
+  dst[i] = vec4(
+    Math.min(Math.max(c.x * g + o, 0.0), 1.0),
+    Math.min(Math.max(c.y * g + o, 0.0), 1.0),
+    Math.min(Math.max(c.z * g + o, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function exposureCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_exposure(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 && p[1] == 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_exposure, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(exposureCopy, n, mut layer, tmp);
+}

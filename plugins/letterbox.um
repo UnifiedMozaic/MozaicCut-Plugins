@@ -1,0 +1,58 @@
+// @effect letterbox "シネスコの帯（上下か左右を黒い帯で隠し、映画の横長の画面にする）"
+// @label "シネスコの帯"
+// @category style
+// @init 2.39
+// @param ratio 0 0..4 "残す画面の横縦比（2.39 でシネスコ、1.85 でビスタ。0 で何もしない）"
+// @param opacity 1 0..1 "帯の濃さ（1 で真っ黒）"
+// @param offset 0 -1..1 "残す画面の上下（左右）の位置（0 で中央、-1 で上（左）に寄せる）"
+// @whole
+// @gpu 1
+//
+// 層が比より縦長なら上下に、横長なら左右に帯を出す。画面全体に掛けるときは project の行に書く。
+// 色を暗くするだけなので、アルファは変えない。
+
+export kernel function fx_gpu_letterbox(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const r = p[0];
+  if (r <= 0.0 || w == 0 || h == 0) {
+    dst[i] = c;
+    return;
+  }
+  const wf = w as f32;
+  const hf = h as f32;
+  const off = Math.min(Math.max(p[2], -1.0), 1.0);
+  const x = ((i % w) as f32) + 0.5;
+  const y = ((i / w) as f32) + 0.5;
+  let inBar = false;
+  if (wf / hf < r) {
+    const keep = wf / r;
+    const top = (hf - keep) * 0.5 * (1.0 + off);
+    inBar = y < top || y > top + keep;
+  } else {
+    const keep = hf * r;
+    const left = (wf - keep) * 0.5 * (1.0 + off);
+    inBar = x < left || x > left + keep;
+  }
+  if (!inBar) {
+    dst[i] = c;
+    return;
+  }
+  const k = 1.0 - Math.min(Math.max(p[1], 0.0), 1.0);
+  dst[i] = vec4(c.x * k, c.y * k, c.z * k, c.w);
+}
+
+kernel function letterboxCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_letterbox(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_letterbox, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(letterboxCopy, n, mut layer, tmp);
+}

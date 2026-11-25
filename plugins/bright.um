@@ -1,0 +1,32 @@
+// @effect bright "明るさを変える（rgb に同じ量を足す）"
+// @label "明るさ"
+// @category color
+// @init 0.2
+// @param amount 0 -1..1 "足す量（-1 で黒、1 で白に近づく）"
+// @gpu 1
+//
+// 色の効果なので、アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_bright(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + a, 0.0), 1.0),
+    Math.min(Math.max(c.y + a, 0.0), 1.0),
+    Math.min(Math.max(c.z + a, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function brightCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_bright(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_bright, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(brightCopy, n, mut layer, tmp);
+}

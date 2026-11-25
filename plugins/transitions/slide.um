@@ -1,0 +1,51 @@
+// @transition slide "次の映像が指定方向から滑り込んで覆う"
+// @label "スライドイン"
+
+kernel function trSlideSin(rad: f32): f32 {
+  const tau: f32 = 6.283185307;
+  const pi: f32 = 3.141592654;
+  let x = rad - Math.floor((rad + pi) / tau) * tau;
+  const x2 = x * x;
+  return x * (1.0 - x2 * (0.16666667 - x2 * (0.00833333 - x2 * 0.00019841)));
+}
+
+export kernel function tr_gpu_slide(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const rad = angle * 0.0174532925;
+  const dx = trSlideSin(rad + 1.570796327);
+  const dy = trSlideSin(rad);
+  const wi = w as i32;
+  const hi = h as i32;
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const ep = 1.0 - (1.0 - p) * (1.0 - p);
+  const ox = Math.floor((1.0 - ep) * dx * (wi as f32) + 0.5) as i32;
+  const oy = Math.floor((1.0 - ep) * dy * (hi as f32) + 0.5) as i32;
+  const bx = x - ox;
+  const by = y - oy;
+  if (bx >= 0 && bx < wi && by >= 0 && by < hi) {
+    dst[i] = b[(by * wi + bx) as u32];
+  } else {
+    dst[i] = a[i];
+  }
+}
+
+kernel function trSlideCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_slide(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_slide, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trSlideCopy, n, mut a, tmp);
+}

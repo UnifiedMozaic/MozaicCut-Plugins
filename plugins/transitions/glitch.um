@@ -1,0 +1,51 @@
+// @transition glitch "デジタルノイズと横ずれを挟んで切り替える"
+// @label "グリッチ転換"
+
+export kernel function tr_gpu_glitch(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const wi = w as i32;
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const intensity = 1.0 - Math.abs(p * 2.0 - 1.0);
+  const band = y / 12;
+  const h1 = ((band * 1103515245 + Math.floor(p * 60.0) as i32 * 12345) & 0x7fffffff) as f32 / 2147483647.0;
+  const h2 = ((band * 1597334677 + 777) & 0x7fffffff) as f32 / 2147483647.0;
+  const shift = Math.floor((h1 - 0.5) * intensity * (w as f32) * 0.14) as i32;
+  const rgbShift = Math.floor(intensity * 10.0) as i32;
+  const useB = (h2 < p);
+  const sx = Math.min(Math.max(x + shift, 0), wi - 1);
+  const sxR = Math.min(Math.max(sx + rgbShift, 0), wi - 1);
+  const sxB = Math.min(Math.max(sx - rgbShift, 0), wi - 1);
+  const row = (y * wi) as u32;
+  if (useB) {
+    const cr = b[row + (sxR as u32)];
+    const cg = b[row + (sx as u32)];
+    const cb = b[row + (sxB as u32)];
+    dst[i] = vec4(cr.x, cg.y, cb.z, cg.w);
+  } else {
+    const cr = a[row + (sxR as u32)];
+    const cg = a[row + (sx as u32)];
+    const cb = a[row + (sxB as u32)];
+    dst[i] = vec4(cr.x, cg.y, cb.z, cg.w);
+  }
+}
+
+kernel function trGlitchCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_glitch(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_glitch, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trGlitchCopy, n, mut a, tmp);
+}

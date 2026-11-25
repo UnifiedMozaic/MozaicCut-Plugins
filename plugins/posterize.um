@@ -1,0 +1,33 @@
+// @effect posterize "階調を減らす（イラスト・アニメ風の段階的な色にする）"
+// @label "ポスタライズ"
+// @category color
+// @param levels 4 2..32 "階調の段数（小さいほど段階がはっきりする。小数は四捨五入）"
+// @gpu 1
+
+export kernel function fx_gpu_posterize(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const lv = Math.max(Math.floor(p[0] + 0.5), 2.0);
+  const step = lv - 1.0;
+  const r = Math.floor(c.x * step + 0.5) / step;
+  const g = Math.floor(c.y * step + 0.5) / step;
+  const b = Math.floor(c.z * step + 0.5) / step;
+  dst[i] = vec4(
+    Math.min(Math.max(r, 0.0), 1.0),
+    Math.min(Math.max(g, 0.0), 1.0),
+    Math.min(Math.max(b, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function posterizeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_posterize(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_posterize, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(posterizeCopy, n, mut layer, tmp);
+}

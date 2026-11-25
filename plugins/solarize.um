@@ -1,0 +1,49 @@
+// @effect solarize "ソラリゼーション（明るい部分を反転して幻想的な階調にする）"
+// @label "ソラリゼーション"
+// @category color
+// @param amount 0.8 0..1 "強さ（0 で何もしない、1 で完全に折り返す）"
+// @param cutoff 0.5 0.1..0.9 "反転が始まる明るさの境目"
+// @gpu 1
+
+kernel function solarizeChan(v: f32, cut: f32): f32 {
+  if (v <= cut) {
+    return v;
+  }
+  const span = Math.max(1.0 - cut, 0.001);
+  return Math.max(cut * (1.0 - (v - cut) / span), 0.0);
+}
+
+export kernel function fx_gpu_solarize(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const amt = p[0];
+  if (amt <= 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const cut = p[1];
+  const sr = solarizeChan(c.x, cut);
+  const sg = solarizeChan(c.y, cut);
+  const sb = solarizeChan(c.z, cut);
+  dst[i] = vec4(
+    c.x + (sr - c.x) * amt,
+    c.y + (sg - c.y) * amt,
+    c.z + (sb - c.z) * amt,
+    c.w,
+  );
+}
+
+kernel function solarizeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_solarize(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_solarize, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(solarizeCopy, n, mut layer, tmp);
+}

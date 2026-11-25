@@ -1,0 +1,83 @@
+// @effect motionblur "指定した角度の方向にぶらす（方向ブラー）"
+// @label "方向ブラー"
+// @category blur
+// @thumb 0=3
+// @param length 8 0..48 "ぶれの半径（画素。小数は四捨五入。0 で何もしない）"
+// @param angle 0 -180..180 "ぶれの方向の角度（度。0 で横、90 で縦）"
+// @reach length 1 round
+// @gpu 1
+
+kernel function mbSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function mbCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return mbSin(x + 0.5 * PI);
+}
+
+kernel function mbCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_motionblur(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const r = Math.floor(p[0] + 0.5) as i32;
+  if (r <= 0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const rad = p[1] * 0.0174532925;
+  const dx = mbCos(rad);
+  const dy = mbSin(rad);
+  const x = (i % w) as f32;
+  const y = (i / w) as f32;
+  const maxX = (w as i32) - 1;
+  const maxY = (h as i32) - 1;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const fk = k as f32;
+    const sx = Math.min(Math.max(Math.floor(x + dx * fk + 0.5) as i32, 0), maxX) as u32;
+    const sy = Math.min(Math.max(Math.floor(y + dy * fk + 0.5) as i32, 0), maxY) as u32;
+    const c = src[sy * w + sx];
+    acc = acc + vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+  }
+  const inv = 1.0 / ((2 * r + 1) as f32);
+  const a = Math.min(Math.max(acc.w * inv, 0.0), 1.0);
+  if (a <= 0.0 || acc.w <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  dst[i] = vec4(
+    Math.min(Math.max(acc.x / acc.w, 0.0), 1.0),
+    Math.min(Math.max(acc.y / acc.w, 0.0), 1.0),
+    Math.min(Math.max(acc.z / acc.w, 0.0), 1.0),
+    a,
+  );
+}
+
+export function fx_motionblur(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const r = Math.floor(p[0] + 0.5) as i32;
+  if (r <= 0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_motionblur, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(mbCopy, n, mut layer, tmp);
+}

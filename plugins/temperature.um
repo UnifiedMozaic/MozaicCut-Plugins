@@ -1,0 +1,45 @@
+// @effect temperature "色温度（暖かい橙と冷たい青、緑と赤紫の向きに色を寄せる）"
+// @label "色温度"
+// @category color
+// @init 0.4
+// @param warmth 0 -1..1 "色温度（+ で暖かい橙、- で冷たい青。0 で何もしない）"
+// @param tint 0 -1..1 "色かぶり（+ で赤紫、- で緑。0 で何もしない）"
+// @gpu 1
+//
+// rgb のそれぞれに掛ける数を変える（ホワイトバランスと同じ考え方）。灰色の明るさがなるべく変わらないよう、
+// 緑の重みの大きい明るさを保つ向きに配分する。アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_temperature(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const t = p[0];
+  const m = p[1];
+  if (t == 0.0 && m == 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const kr = 1.0 + 0.22 * t + 0.10 * m;
+  const kg = 1.0 + 0.03 * t - 0.14 * m;
+  const kb = 1.0 - 0.28 * t + 0.10 * m;
+  dst[i] = vec4(
+    Math.min(Math.max(c.x * kr, 0.0), 1.0),
+    Math.min(Math.max(c.y * kg, 0.0), 1.0),
+    Math.min(Math.max(c.z * kb, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function temperatureCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_temperature(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 && p[1] == 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_temperature, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(temperatureCopy, n, mut layer, tmp);
+}

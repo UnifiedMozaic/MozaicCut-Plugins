@@ -1,0 +1,31 @@
+// @effect invert "色を反転する"
+// @label "色の反転"
+// @category color
+// @param amount 1 0..1 "強さ（1 で 1 - 色、0.5 で一面の灰色、0 でそのまま）"
+// @gpu 1
+//
+// 色の効果なので、アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_invert(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + (1.0 - 2.0 * c.x) * a, 0.0), 1.0),
+    Math.min(Math.max(c.y + (1.0 - 2.0 * c.y) * a, 0.0), 1.0),
+    Math.min(Math.max(c.z + (1.0 - 2.0 * c.z) * a, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function invertCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_invert(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_invert, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(invertCopy, n, mut layer, tmp);
+}

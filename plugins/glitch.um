@@ -1,0 +1,61 @@
+// @effect glitch "デジタルグリッチ（横帯のずれと色ずれを起こす）"
+// @label "グリッチ"
+// @category style
+// @thumb 0=5
+// @param amount 16 0..128 "ずれの強さ（画素。0 で何もしない）"
+// @param seed 1 0..1000 "乱数の種（キーフレームで動かすとフレームごとにグリッチが暴れる）"
+// @whole
+// @gpu 1
+
+kernel function glitchHash(n0: u32): f32 {
+  let n = n0;
+  n = (n ^ 61) ^ (n >> 16);
+  n = n + (n << 3);
+  n = n ^ (n >> 4);
+  n = n * 668265261;
+  n = n ^ (n >> 15);
+  return ((n & 65535) as f32) / 32767.5 - 1.0;
+}
+
+kernel function glitchCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_glitch(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const amt = p[0];
+  if (amt <= 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const seed = Math.max(Math.floor(p[1] + 0.5) as i32, 0) as u32;
+  const x = (i % w) as i32;
+  const y = i / w;
+  const maxX = (w as i32) - 1;
+  const band = y / 12 + seed * 131;
+  const hv = glitchHash(band);
+  let shift = 0;
+  // 約半分の帯だけを強くずらす
+  if (hv > 0.25 || hv < -0.25) {
+    shift = Math.floor(hv * amt + 0.5) as i32;
+  }
+  const cShift = Math.floor(amt * 0.25 + 0.5) as i32;
+  const rx = Math.min(Math.max(x + shift - cShift, 0), maxX) as u32;
+  const gx = Math.min(Math.max(x + shift, 0), maxX) as u32;
+  const bx = Math.min(Math.max(x + shift + cShift, 0), maxX) as u32;
+  const cr = src[y * w + rx];
+  const cg = src[y * w + gx];
+  const cb = src[y * w + bx];
+  dst[i] = vec4(cr.x, cg.y, cb.z, cg.w);
+}
+
+export function fx_glitch(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_glitch, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(glitchCopy, n, mut layer, tmp);
+}

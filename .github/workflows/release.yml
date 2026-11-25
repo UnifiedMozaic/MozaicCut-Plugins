@@ -1,0 +1,74 @@
+# MozaicCut 標準プラグイン一式（.mzplug）をビルドして GitHub Release へ配布する。
+# .mzplug は wasm32 + WGSL 同梱の OS 非依存バイナリなので、Ubuntu 1 台だけで
+# Windows / macOS 両対応の mozaiccut-plugins.zip を約 1 分で生成できる。
+name: release-plugins
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: MozaicCut-Plugins
+
+      - uses: actions/checkout@v4
+        with:
+          repository: UnifiedMozaic/UnifiedMozaic
+          ref: ${{ vars.UM_REF || 'main' }}
+          path: UnifiedMozaic
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: UnifiedMozaic/package.json
+
+      - name: Install LLVM / lld (for wasm32-plugin)
+        run: sudo apt-get update && sudo apt-get install -y clang lld zip
+
+      - name: Build all .mzplug plugins + zip
+        working-directory: MozaicCut-Plugins
+        env:
+          UM_HOME: ${{ github.workspace }}/UnifiedMozaic
+        run: node tools/build.mjs --force --zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mozaiccut-plugins
+          path: |
+            MozaicCut-Plugins/dist/mozaiccut-plugins.zip
+            MozaicCut-Plugins/dist/manifest.json
+            MozaicCut-Plugins/dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mozaiccut-plugins
+          path: assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          count=$(node -e "console.log(JSON.parse(require('fs').readFileSync('assets/manifest.json','utf8')).count)")
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "MozaicCut Plugins $GITHUB_REF_NAME" \
+            --notes "Windows / macOS 共通の独立プラグイン一式（計 ${count} 個、GPU+CPU ハイブリッド .mzplug）。" \
+            assets/mozaiccut-plugins.zip assets/manifest.json assets/SHA256SUMS.txt

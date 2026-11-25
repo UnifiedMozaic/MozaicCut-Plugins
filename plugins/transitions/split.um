@@ -1,0 +1,45 @@
+// @transition split "中央の線から左右（trans.angle=90 で上下）に開いて次の映像を出す"
+// @label "スプリット（中央から開く）"
+//
+// trans.angle が 0 なら縦の線から左右へ、90 なら横の線から上下へ開く（その間の角度は 0 と 90 のどちらか近い方）。
+// 境目は trans.soft でぼかす。
+
+export kernel function tr_gpu_split(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  let ang = angle - Math.floor(angle / 180.0) * 180.0;
+  const vertical = ang > 45.0 && ang < 135.0;
+  let d: f32 = 0.0;
+  if (vertical) {
+    d = Math.abs(((i / w) as f32 + 0.5) / (h as f32) - 0.5) * 2.0;
+  } else {
+    d = Math.abs(((i % w) as f32 + 0.5) / (w as f32) - 0.5) * 2.0;
+  }
+  const s = Math.max(soft, 0.002);
+  const edge = p * (1.0 + s) - s * 0.5;
+  const t = Math.min(Math.max((edge - d + s * 0.5) / s, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[i];
+  const cb = b[i];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trSplitCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_split(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_split, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trSplitCopy, n, mut a, tmp);
+}

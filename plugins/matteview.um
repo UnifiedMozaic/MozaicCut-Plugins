@@ -1,0 +1,55 @@
+// @effect matteview "アルファ（キーやマスクの結果）を見る（確かめる用）"
+// @label "アルファを見る"
+// @category key
+// @param mode 1 0..2 "見せ方（1: アルファを白黒で。白が不透明、黒が透明。2: 市松模様の上に重ねる。0: 何もしない。小数は四捨五入）"
+// @param size 16 2..256 "市松模様のます目の一辺（画素。mode 2 のとき）"
+// @gpu 1
+//
+// chromakey / lumakey / マスクの後ろに書いて、抜け具合を見るための効果。結果の層は不透明になる。
+//   video "gs.mp4" chromakey matteview          ← 白黒のマット
+//   video "gs.mp4" chromakey matteview=2        ← 灰色の市松模様の上に重ねた色（こぼれの残り・縁の色を見る）
+// 書き出しの前に消す。市松模様は層の左上から並べる（層の左上からの位置を使う。帯に分けない宣言 @whole は、生成器が読めるようになってから足す）。
+
+export kernel function fx_gpu_matteview(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const mode = Math.floor(p[0] + 0.5) as i32;
+  if (mode <= 0 || w == 0 || h == 0) {
+    dst[i] = c;
+    return;
+  }
+  const a = Math.min(Math.max(c.w, 0.0), 1.0);
+  if (mode == 1) {
+    dst[i] = vec4(a, a, a, 1.0);
+    return;
+  }
+  const size = Math.max(Math.floor(p[1] + 0.5) as i32, 1) as u32;
+  const cx = (i % w) / size;
+  const cy = (i / w) / size;
+  let bg = 0.4;
+  if (((cx + cy) & 1) == 1) {
+    bg = 0.6;
+  }
+  dst[i] = vec4(
+    c.x * a + bg * (1.0 - a),
+    c.y * a + bg * (1.0 - a),
+    c.z * a + bg * (1.0 - a),
+    1.0,
+  );
+}
+
+kernel function matteviewCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_matteview(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const mode = Math.floor(p[0] + 0.5) as i32;
+  if (mode <= 0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_matteview, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(matteviewCopy, n, mut layer, tmp);
+}

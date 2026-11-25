@@ -1,0 +1,41 @@
+// @transition zoom "前の映像が拡大しながら次の映像へ切り替わる"
+// @label "ズーム転換"
+
+export kernel function tr_gpu_zoom(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const wi = w as i32;
+  const hi = h as i32;
+  const fx = ((i % w) as f32 + 0.5) / (w as f32);
+  const fy = ((i / w) as f32 + 0.5) / (h as f32);
+  const ep = p * p * (3.0 - 2.0 * p);
+  const sa = 1.0 + ep * 0.65;
+  const sb = 1.0 + (1.0 - ep) * 0.35;
+  const ax = Math.min(Math.max(Math.floor(((fx - 0.5) / sa + 0.5) * (w as f32)) as i32, 0), wi - 1);
+  const ay = Math.min(Math.max(Math.floor(((fy - 0.5) / sa + 0.5) * (h as f32)) as i32, 0), hi - 1);
+  const bx = Math.min(Math.max(Math.floor(((fx - 0.5) / sb + 0.5) * (w as f32)) as i32, 0), wi - 1);
+  const by = Math.min(Math.max(Math.floor(((fy - 0.5) / sb + 0.5) * (h as f32)) as i32, 0), hi - 1);
+  const ca = a[(ay * wi + ax) as u32];
+  const cb = b[(by * wi + bx) as u32];
+  const q = 1.0 - ep;
+  dst[i] = vec4(ca.x * q + cb.x * ep, ca.y * q + cb.y * ep, ca.z * q + cb.z * ep, ca.w * q + cb.w * ep);
+}
+
+kernel function trZoomCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_zoom(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_zoom, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trZoomCopy, n, mut a, tmp);
+}

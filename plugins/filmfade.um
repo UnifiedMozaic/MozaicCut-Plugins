@@ -1,0 +1,48 @@
+// @effect filmfade "色あせたフィルム（黒を浮かせ、白を少し沈め、色を少し抜く）"
+// @label "色あせフィルム"
+// @category color
+// @init 0.6
+// @param amount 0 0..1 "色あせの強さ（0 で何もしない）"
+// @param warm 0.3 -1..1 "浮いた黒の色（+ で暖かい茶、- で青緑）"
+// @gpu 1
+//
+// 黒は amount × 0.2 まで浮き、白は amount × 0.08 だけ沈む。彩度は amount × 0.3 抜く。アルファは変えない。
+
+export kernel function fx_gpu_filmfade(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = Math.min(Math.max(p[0], 0.0), 1.0);
+  if (a <= 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const ds = 1.0 - a * 0.3;
+  const r0 = y + (c.x - y) * ds;
+  const g0 = y + (c.y - y) * ds;
+  const b0 = y + (c.z - y) * ds;
+  const lift = a * 0.2;
+  const span = 1.0 - lift - a * 0.08;
+  const wm = p[1] * a * 0.04;
+  dst[i] = vec4(
+    Math.min(Math.max(lift + wm + r0 * span, 0.0), 1.0),
+    Math.min(Math.max(lift + g0 * span, 0.0), 1.0),
+    Math.min(Math.max(lift - wm + b0 * span, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function filmfadeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_filmfade(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_filmfade, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(filmfadeCopy, n, mut layer, tmp);
+}

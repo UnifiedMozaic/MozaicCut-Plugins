@@ -1,0 +1,88 @@
+// @effect pixelate "モザイクにする（各ブロックを平均の色で塗る）"
+// @label "モザイク"
+// @category style
+// @thumb 0=4
+// @param size 12 1..256 "ブロックの一辺（画素。小数は四捨五入。1 で何もしない）"
+// @alias mosaic
+// @whole
+// @gpu 3
+//
+// ブロックは層の左上から並べる（右端・下端のブロックは小さくなることがある）。
+// アルファもブロックで平均する。rgb はアルファで重み付けして平均する（rgb*a の平均を a の平均で割る。
+// a の平均が 0 なら (0,0,0,0)）。透明な画素の見えない色は混ざらない。不透明な層ではただの平均と同じ。
+//
+// 3 パス（GPU / CPU 共通）で計算し、1 画素あたりの読み取りを大きさによらず一定にする:
+//   pass 0: ブロック左端 (x == x0) の画素に、その行のブロック和 (rgb*a, a) を書く
+//   pass 1: ブロック左上 (x == x0 && y == y0) の画素に、ブロック全体の平均色（ストレートアルファ）を書く
+//   pass 2: 各画素が自分のブロック左上 (x0, y0) の色を読む
+
+export kernel function fx_gpu_pixelate(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const si = Math.floor(p[0] + 0.5) as i32;
+  if (si <= 1 || w == 0 || h == 0) {
+    dst[i] = orig[i];
+    return;
+  }
+  const s = si as u32;
+  const x = i % w;
+  const y = i / w;
+  const x0 = (x / s) * s;
+  const y0 = (y / s) * s;
+  if (pass == 0) {
+    if (x != x0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    const x1 = Math.min(x0 + s, w);
+    let acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (let xx = x0; xx < x1; xx++) {
+      const c = src[y * w + xx];
+      acc = acc + vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+    }
+    dst[i] = acc;
+    return;
+  }
+  if (pass == 1) {
+    if (x != x0 || y != y0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    const y1 = Math.min(y0 + s, h);
+    let acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (let yy = y0; yy < y1; yy++) {
+      acc = acc + src[yy * w + x0];
+    }
+    const n = ((Math.min(x0 + s, w) - x0) * (y1 - y0)) as f32;
+    const a = Math.min(Math.max(acc.w / n, 0.0), 1.0);
+    if (acc.w <= 0.0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    dst[i] = vec4(
+      Math.min(Math.max(acc.x / acc.w, 0.0), 1.0),
+      Math.min(Math.max(acc.y / acc.w, 0.0), 1.0),
+      Math.min(Math.max(acc.z / acc.w, 0.0), 1.0),
+      a,
+    );
+    return;
+  }
+  dst[i] = src[y0 * w + x0];
+}
+
+kernel function pixelateCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_pixelate(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const si = Math.floor(p[0] + 0.5) as i32;
+  if (si <= 1 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_pixelate, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(fx_gpu_pixelate, n, mut layer, tmp, tmp, w, h, p, 1 as u32);
+  dispatch(fx_gpu_pixelate, n, mut tmp, layer, layer, w, h, p, 2 as u32);
+  dispatch(pixelateCopy, n, mut layer, tmp);
+}

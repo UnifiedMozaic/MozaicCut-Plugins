@@ -1,0 +1,48 @@
+// @effect vignette "周辺を暗くする"
+// @label "周辺減光"
+// @category style
+// @param strength 0.5 0..1 "暗くする強さ（1 で、半径 + 幅より外が黒くなる。既定の半径と幅では四隅が黒くなる）"
+// @param radius 0.6 0..2 "暗くし始める半径（掛ける層の対角の半分を 1 とする）"
+// @param softness 0.4 0..2 "暗くなっていく幅（半径からこの幅で強さいっぱいまで暗くなる）"
+// @whole
+// @gpu 1
+//
+// 中心は掛ける層の中央（クリップの行なら、そのクリップの層。文字なら文字の箱、小窓なら小窓の中。
+// 画面全体の中央にしたいときは project の行に書く）。距離は円（縦横比に合わせた楕円ではない）。半径から半径 + 幅までを smoothstep でつなぐ。
+// 四隅の距離がほぼ 1 なので、既定値は半径 + 幅 = 1 にして、四隅で strength いっぱいに暗くなるようにしてある。
+// 色を暗くするだけなので、アルファは変えない。結果は 0..1 に収める。
+
+export kernel function fx_gpu_vignette(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const hw = (w as f32) * 0.5;
+  const hh = (h as f32) * 0.5;
+  const dx = ((i % w) as f32) + 0.5 - hw;
+  const dy = ((i / w) as f32) + 0.5 - hh;
+  const d = Math.sqrt(dx * dx + dy * dy) / Math.sqrt(hw * hw + hh * hh);
+  let t = 1.0;
+  if (p[2] > 0.0) {
+    t = Math.min(Math.max((d - p[1]) / p[2], 0.0), 1.0);
+  } else if (d < p[1]) {
+    t = 0.0;
+  }
+  const k = 1.0 - p[0] * t * t * (3.0 - 2.0 * t);
+  dst[i] = vec4(
+    Math.min(Math.max(c.x * k, 0.0), 1.0),
+    Math.min(Math.max(c.y * k, 0.0), 1.0),
+    Math.min(Math.max(c.z * k, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function vignetteCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_vignette(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  dispatch(fx_gpu_vignette, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(vignetteCopy, n, mut layer, tmp);
+}

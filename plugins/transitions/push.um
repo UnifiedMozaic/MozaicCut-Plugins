@@ -1,0 +1,55 @@
+// @transition push "前の映像を押し出しながら次の映像が入る"
+// @label "プッシュ（押し出し）"
+
+kernel function trPushSin(rad: f32): f32 {
+  const tau: f32 = 6.283185307;
+  const pi: f32 = 3.141592654;
+  let x = rad - Math.floor((rad + pi) / tau) * tau;
+  const x2 = x * x;
+  return x * (1.0 - x2 * (0.16666667 - x2 * (0.00833333 - x2 * 0.00019841)));
+}
+
+export kernel function tr_gpu_push(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const rad = angle * 0.0174532925;
+  const dx = trPushSin(rad + 1.570796327);
+  const dy = trPushSin(rad);
+  const wi = w as i32;
+  const hi = h as i32;
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const ep = p * p * (3.0 - 2.0 * p);
+  const shiftX = Math.floor(ep * dx * (wi as f32) + 0.5) as i32;
+  const shiftY = Math.floor(ep * dy * (hi as f32) + 0.5) as i32;
+  const ax = x + shiftX;
+  const ay = y + shiftY;
+  if (ax >= 0 && ax < wi && ay >= 0 && ay < hi) {
+    dst[i] = a[(ay * wi + ax) as u32];
+    return;
+  }
+  const bx = ax - Math.floor(dx * (wi as f32) + 0.5) as i32;
+  const by = ay - Math.floor(dy * (hi as f32) + 0.5) as i32;
+  const cbx = Math.min(Math.max(bx, 0), wi - 1);
+  const cby = Math.min(Math.max(by, 0), hi - 1);
+  dst[i] = b[(cby * wi + cbx) as u32];
+}
+
+kernel function trPushCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_push(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_push, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trPushCopy, n, mut a, tmp);
+}

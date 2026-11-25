@@ -1,0 +1,43 @@
+// @effect tint "特定の色を乗せる（カラーフィルター）"
+// @label "カラーフィルター"
+// @category color
+// @param amount 0.4 0..1 "色を乗せる強さ（0 で何もしない）"
+// @param r 0.2 0..1 "乗せる色の赤"
+// @param g 0.6 0..1 "乗せる色の緑"
+// @param b 1.0 0..1 "乗せる色の青"
+// @gpu 1
+
+export kernel function fx_gpu_tint(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  const a = p[0];
+  if (a <= 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const tr = Math.min(Math.max(y * p[1] * 1.35, 0.0), 1.0);
+  const tg = Math.min(Math.max(y * p[2] * 1.35, 0.0), 1.0);
+  const tb = Math.min(Math.max(y * p[3] * 1.35, 0.0), 1.0);
+  dst[i] = vec4(
+    c.x + (tr - c.x) * a,
+    c.y + (tg - c.y) * a,
+    c.z + (tb - c.z) * a,
+    c.w,
+  );
+}
+
+kernel function tintCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_tint(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_tint, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(tintCopy, n, mut layer, tmp);
+}

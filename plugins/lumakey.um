@@ -1,0 +1,228 @@
+// @effect lumakey "ルミナンスキー（暗い所か明るい所を透明にする）"
+// @label "ルミナンスキー"
+// @category key
+// @param threshold 0.1 0..1 "しきい値（明るさ 0〜1。これより暗い所を透明にする。invert なら明るい所。0 なら何も抜かない）"
+// @param softness 0.1 0..1 "柔らかさ（しきい値から明るい側へこの幅で、透明から不透明へなめらかに変わる。invert なら暗い側へ。0 なら境目がくっきり）"
+// @param invert 0 0..1 "向き（0 か 1。1 で、しきい値より明るい所を透明にする。0.5 以上は 1 とみなす）"
+// @param shrink 0 -16..16 "エッジの収縮（画素。正で透明でない所を縮め、負で広げる。小数は四捨五入）"
+// @param feather 0 0..32 "エッジのぼかし（キーの境目をぼかす。広がりはおよそ 2×feather 画素。小数は四捨五入）"
+// @whole
+//
+// 明るさは BT.709 の Y（0.2126 R + 0.7152 G + 0.0722 B。層の値そのまま）。
+// キー（不透明さ）k:
+//   invert = 0: 明るさがしきい値より暗い所は 0。しきい値から しきい値 + 柔らかさ まで smoothstep で 0 から 1（柔らかさは明るい側だけに広がる）。
+//               柔らかさ 0 なら「しきい値より暗い（y < しきい値）」所だけが 0。しきい値 0 なら何も抜かない（純粋な黒も残る）。
+//   invert = 1: 向きが逆。しきい値より明るい所は 0、しきい値 - 柔らかさ から しきい値 まで 1 から 0。しきい値 1 なら何も抜かない。
+// 結果のアルファ = 元のアルファ × k（色は変えない。アルファは元より大きくならないので @reach は要らない）。
+// 元のアルファが 0 の画素はキーに関わらない（k = 1 として収縮・ぼかしに渡す）。
+// エッジ（収縮 → ぼかし）は chromakey と同じで、キーだけに掛ける（半径が LKEY_LINE_MIN を超えたら線ごとに滑らせる）。
+// マスク（ガーベッジマット）は後ろに書く（docs/keying.md）。
+// 炎や光のように黒い背景に明るく重ねたい素材は、キーで抜くより、合成のモードのスクリーン / 加算のほうが自然になる。
+// 帯に分けない宣言（@whole）は、生成器（tools/gen-plugins.mjs）が読めるようになってから足す。
+
+const LKEY_LINE_MIN: i32 = 8;
+
+// 画素 c のキー（不透明さ 0..1）。
+kernel function lkeyMatteOf(c: vec4<f32>, p: f32[8]): f32 {
+  if (c.w <= 0.0) {
+    return 1.0;
+  }
+  const y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+  const th = p[0];
+  let d = y - th;
+  if (p[2] >= 0.5) {
+    if (th >= 1.0) {
+      return 1.0;
+    }
+    d = th - y;
+  } else if (th <= 0.0) {
+    return 1.0;
+  }
+  if (d < 0.0) {
+    return 0.0;
+  }
+  if (p[1] <= 0.0) {
+    return 1.0;
+  }
+  const t = Math.min(d / p[1], 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// 収縮・ぼかしがないとき: 1 回で仕上げる。
+export kernel function lkeyDirect(i: u32, layer: mut Buffer<vec4<f32>>, p: f32[8]): void {
+  const c = layer[i];
+  layer[i] = vec4(c.x, c.y, c.z, c.w * lkeyMatteOf(c, p));
+}
+
+// 収縮・ぼかしの前: キーだけを m に書く。
+export kernel function lkeyInit(i: u32, m: mut Buffer<f32>, layer: Buffer<vec4<f32>>, p: f32[8]): void {
+  m[i] = lkeyMatteOf(layer[i], p);
+}
+
+// 仕上げ: アルファ = 元のアルファ × m のキー。
+export kernel function lkeyStore(i: u32, layer: mut Buffer<vec4<f32>>, m: Buffer<f32>): void {
+  const c = layer[i];
+  layer[i] = vec4(c.x, c.y, c.z, Math.min(Math.max(c.w * m[i], 0.0), 1.0));
+}
+
+// キー src を横（vertical = 0）か縦（1）に、窓 2r+1 で処理して dst に書く（画素ごと。小さい半径用）。
+// op: 0 = 最小（収縮）、1 = 最大（広げる）、2 = 平均（ぼかし）。端は端の画素をくり返す。
+export kernel function lkeyEdge(
+  i: u32, dst: mut Buffer<f32>, src: Buffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32,
+): void {
+  let pos = (i % w) as i32;
+  let last = (w as i32) - 1;
+  let base = i - (pos as u32);
+  let step: u32 = 1;
+  if (vertical != 0) {
+    pos = (i / w) as i32;
+    last = (h as i32) - 1;
+    base = i % w;
+    step = w;
+  }
+  let acc = 0.0;
+  if (op == 0) {
+    acc = 1.0;
+  }
+  for (let k = -r; k <= r; k++) {
+    const q = Math.min(Math.max(pos + k, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (op == 0) {
+      acc = Math.min(acc, v);
+    } else if (op == 1) {
+      acc = Math.max(acc, v);
+    } else {
+      acc = acc + v;
+    }
+  }
+  if (op == 2) {
+    acc = acc / ((2 * r + 1) as f32);
+  }
+  dst[i] = acc;
+}
+
+// 線 li（横なら行、縦なら列）を窓 2r+1 で処理して work[画素の番号] に書く（1 本につき 1 つの実行。大きい半径用）。
+// 平均は窓を滑らせる（入る値を足し、出る値を引く）。最小・最大は van Herk の方法: 端を r ずつくり返して伸ばした線を
+// 長さ 2r+1 の区切りに分け、区切りの頭からの累積（g）と尻からの累積（hh）を work の後ろ（at から）に書き、
+// 窓 [x, x+2r]（伸ばした線の位置）の値を op(hh[x], g[x+2r]) で求める。1 画素あたりの手間は半径によらない。
+export kernel function lkeyLines(
+  li: u32, work: mut RacyBuffer<f32>, src: Buffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32, at: u32,
+): void {
+  let base = li * w;
+  let step: u32 = 1;
+  let n = w;
+  if (vertical != 0) {
+    base = li;
+    step = w;
+    n = h;
+  }
+  const last = (n as i32) - 1;
+  if (op == 2) {
+    const inv = 1.0 / ((2 * r + 1) as f32);
+    let acc = 0.0;
+    for (let k = -r; k <= r; k++) {
+      const kk = Math.min(Math.max(k, 0), last);
+      acc = acc + src[base + (kk as u32) * step];
+    }
+    for (let x = 0; x <= last; x++) {
+      work[base + (x as u32) * step] = acc * inv;
+      const xin = Math.min(x + r + 1, last);
+      const xout = Math.max(x - r, 0);
+      acc = acc + src[base + (xin as u32) * step] - src[base + (xout as u32) * step];
+    }
+    return;
+  }
+  const blk = 2 * r + 1;
+  const ext = (n as i32) + 2 * r;
+  const g0 = at + li * (ext as u32) * 2;
+  const h0 = g0 + (ext as u32);
+  let acc = 0.0;
+  for (let e = 0; e < ext; e++) {
+    const q = Math.min(Math.max(e - r, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (e % blk == 0) {
+      acc = v;
+    } else if (op == 0) {
+      acc = Math.min(acc, v);
+    } else {
+      acc = Math.max(acc, v);
+    }
+    work[g0 + (e as u32)] = acc;
+  }
+  for (let e = ext - 1; e >= 0; e--) {
+    const q = Math.min(Math.max(e - r, 0), last);
+    const v = src[base + (q as u32) * step];
+    if (e == ext - 1 || (e + 1) % blk == 0) {
+      acc = v;
+    } else if (op == 0) {
+      acc = Math.min(acc, v);
+    } else {
+      acc = Math.max(acc, v);
+    }
+    work[h0 + (e as u32)] = acc;
+  }
+  for (let x = 0; x <= last; x++) {
+    const a = work[h0 + (x as u32)];
+    const b = work[g0 + ((x + 2 * r) as u32)];
+    let v = Math.max(a, b);
+    if (op == 0) {
+      v = Math.min(a, b);
+    }
+    work[base + (x as u32) * step] = v;
+  }
+}
+
+// work の先頭（画素の番号の所）を dst に写す。
+export kernel function lkeyCopy(i: u32, dst: mut Buffer<f32>, work: RacyBuffer<f32>): void {
+  dst[i] = work[i];
+}
+
+// 1 方向の処理（src → dst）。半径が LKEY_LINE_MIN を超えたら線ごとに滑らせる。
+function lkeyPass(dst: mut Buffer<f32>, src: Buffer<f32>, work: mut RacyBuffer<f32>, w: u32, h: u32, r: i32, vertical: u32, op: u32): void {
+  if (r <= LKEY_LINE_MIN) {
+    dispatch(lkeyEdge, w * h, mut dst, src, w, h, r, vertical, op);
+    return;
+  }
+  let lines = h;
+  if (vertical != 0) {
+    lines = w;
+  }
+  dispatch(lkeyLines, lines, mut work, src, w, h, r, vertical, op, w * h);
+  dispatch(lkeyCopy, w * h, mut dst, work);
+}
+
+export function fx_lumakey(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  const sh = Math.floor(Math.abs(p[3]) + 0.5) as i32;
+  const fe = Math.floor(Math.max(p[4], 0.0) + 0.5) as i32;
+  if (sh == 0 && fe == 0) {
+    dispatch(lkeyDirect, n, mut layer, p);
+    return;
+  }
+  let m = new Buffer<f32>(n);
+  let m2 = new Buffer<f32>(n);
+  const rmax = Math.max(sh, fe);
+  let wn: u32 = 1;
+  if (rmax > LKEY_LINE_MIN) {
+    const rr = rmax as u32;
+    wn = n + 2 * Math.max((w + 2 * rr) * h, (h + 2 * rr) * w);
+  }
+  let work = new RacyBuffer<f32>(wn);
+  dispatch(lkeyInit, n, mut m, layer, p);
+  if (sh > 0) {
+    let op: u32 = 0;
+    if (p[3] < 0.0) {
+      op = 1;
+    }
+    lkeyPass(mut m2, m, mut work, w, h, sh, 0, op);
+    lkeyPass(mut m, m2, mut work, w, h, sh, 1, op);
+  }
+  for (let pass = 0; pass < 2 && fe > 0; pass++) {
+    lkeyPass(mut m2, m, mut work, w, h, fe, 0, 2);
+    lkeyPass(mut m, m2, mut work, w, h, fe, 1, 2);
+  }
+  dispatch(lkeyStore, n, mut layer, m);
+}

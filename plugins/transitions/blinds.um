@@ -1,0 +1,54 @@
+// @transition blinds "すだれ状に複数の帯が開いて切り替わる（trans.param で本数）"
+// @label "ブラインド"
+
+kernel function trBlindsSin(rad: f32): f32 {
+  const tau: f32 = 6.283185307;
+  const pi: f32 = 3.141592654;
+  let x = rad - Math.floor((rad + pi) / tau) * tau;
+  const x2 = x * x;
+  return x * (1.0 - x2 * (0.16666667 - x2 * (0.00833333 - x2 * 0.00019841)));
+}
+
+export kernel function tr_gpu_blinds(
+  i: u32, dst: mut Buffer<vec4<f32>>, a: Buffer<vec4<f32>>, b: Buffer<vec4<f32>>,
+  w: u32, h: u32, progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const p = Math.min(Math.max(progress, 0.0), 1.0);
+  const rad = angle * 0.0174532925;
+  const dx = trBlindsSin(rad + 1.570796327);
+  const dy = trBlindsSin(rad);
+  let count = param;
+  if (count < 2.0) {
+    count = 8.0;
+  }
+  const x = ((i % w) as f32 + 0.5) / (w as f32);
+  const y = ((i / w) as f32 + 0.5) / (h as f32);
+  const u = x * dx + y * dy;
+  const scaled = u * count;
+  const frac = scaled - Math.floor(scaled);
+  const s = Math.max(soft, 0.01);
+  const edge = p * (1.0 + s) - s * 0.5;
+  const t = Math.min(Math.max((edge - frac + s * 0.5) / s, 0.0), 1.0);
+  const sm = t * t * (3.0 - 2.0 * t);
+  const ca = a[i];
+  const cb = b[i];
+  const q = 1.0 - sm;
+  dst[i] = vec4(ca.x * q + cb.x * sm, ca.y * q + cb.y * sm, ca.z * q + cb.z * sm, ca.w * q + cb.w * sm);
+}
+
+kernel function trBlindsCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function tr_blinds(
+  a: mut Buffer<vec4<f32>>, b: Buffer<vec4<f32>>, w: u32, h: u32,
+  progress: f32, angle: f32, soft: f32, param: f32,
+): void {
+  const n = w * h;
+  if (n == 0) {
+    return;
+  }
+  let tmp = new Buffer<vec4<f32>>(n);
+  dispatch(tr_gpu_blinds, n, mut tmp, a, b, w, h, progress, angle, soft, param);
+  dispatch(trBlindsCopy, n, mut a, tmp);
+}

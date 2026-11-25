@@ -1,0 +1,78 @@
+// @effect bulge "膨らみ・へこみ（中心を魚眼のように膨らませるか、すぼめる）"
+// @label "膨らみ・へこみ"
+// @category style
+// @init 0.6
+// @param amount 0 -1..1 "強さ（+ で膨らみ、- でへこむ。0 で何もしない）"
+// @param radius 0.5 0.05..2 "効く半径（層の短い辺を 1 とする）"
+// @param cx 0.5 0..1 "中心の横の位置（層の左端 0、右端 1）"
+// @param cy 0.5 0..1 "中心の縦の位置（層の上端 0、下端 1）"
+// @whole
+// @gpu 1
+//
+// 中心からの距離 d が半径より内側の画素を、中心から (1 - amount × (1 - (d / 半径)²)²) 倍の距離の所から取る（双線形補間）。
+// 半径の境目では倍率が 1 になるので、外とつながる。
+
+kernel function bulgeTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const cx = Math.min(Math.max(x, 0), (w as i32) - 1) as u32;
+  const cy = Math.min(Math.max(y, 0), (h as i32) - 1) as u32;
+  return src[cy * w + cx];
+}
+
+kernel function bulgeSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x = fx - 0.5;
+  const y = fy - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = bulgeTexel(src, ix, iy, w, h);
+  const b = bulgeTexel(src, ix + 1, iy, w, h);
+  const c = bulgeTexel(src, ix, iy + 1, w, h);
+  const d = bulgeTexel(src, ix + 1, iy + 1, w, h);
+  const top = a + (b - a) * tx;
+  const bot = c + (d - c) * tx;
+  return top + (bot - top) * ty;
+}
+
+export kernel function fx_gpu_bulge(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  if (p[0] == 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const wf = w as f32;
+  const hf = h as f32;
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const ox = p[2] * wf;
+  const oy = p[3] * hf;
+  const dx = px - ox;
+  const dy = py - oy;
+  const rad = Math.max(p[1], 0.01) * Math.min(wf, hf);
+  const u2 = (dx * dx + dy * dy) / (rad * rad);
+  if (u2 >= 1.0) {
+    dst[i] = src[i];
+    return;
+  }
+  const a = Math.min(Math.max(p[0], -1.0), 1.0) * 0.9;
+  const q = 1.0 - u2;
+  const k = 1.0 - a * q * q;
+  dst[i] = bulgeSample(src, ox + dx * k, oy + dy * k, w, h);
+}
+
+kernel function bulgeCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_bulge(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] == 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_bulge, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(bulgeCopy, n, mut layer, tmp);
+}

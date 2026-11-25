@@ -1,0 +1,50 @@
+// @effect mirror "画面を左右または上下で鏡のように折り返す"
+// @label "ミラー（鏡）"
+// @category style
+// @param mode 1 1..4 "折り返し方（1: 左を右へ、2: 右を左へ、3: 上を下へ、4: 下を上へ）"
+// @whole
+// @gpu 1
+
+kernel function mirrorCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_mirror(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  if (w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const mode = Math.min(Math.max(Math.floor(p[0] + 0.5) as i32, 1), 4);
+  let x = i % w;
+  let y = i / w;
+  if (mode == 1) {
+    if (x >= w / 2) {
+      x = w - 1 - x;
+    }
+  } else if (mode == 2) {
+    if (x < w / 2) {
+      x = w - 1 - x;
+    }
+  } else if (mode == 3) {
+    if (y >= h / 2) {
+      y = h - 1 - y;
+    }
+  } else {
+    if (y < h / 2) {
+      y = h - 1 - y;
+    }
+  }
+  dst[i] = src[y * w + x];
+}
+
+export function fx_mirror(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_mirror, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(mirrorCopy, n, mut layer, tmp);
+}

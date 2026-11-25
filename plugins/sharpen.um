@@ -1,0 +1,71 @@
+// @effect sharpen "くっきりさせる（アンシャープマスク）"
+// @label "シャープ"
+// @category blur
+// @param amount 0.6 0..4 "強さ（元の色とぼかした色の差を、この倍だけ足す）"
+// @param radius 1 1..8 "ぼかしの半径（画素。小数は四捨五入。大きいほど太い輪郭が強まる）"
+// @reach radius 1
+// @gpu 2
+//
+// ぼかしは箱ぼかし 1 回（pass 0 で横を書き、pass 1 で縦を読みながら orig との差を足す）。
+// rgb だけをくっきりさせ、アルファは変えない（縁の透明な所の形を変えないように）。結果は 0..1 に収める。
+// ぼかした色は rgb をアルファで重み付けして平均する（透明な画素の見えない色を混ぜない）。周りがすべて透明なら差は 0。
+
+export kernel function fx_gpu_sharpen(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const a = p[0];
+  if (a <= 0.0 || w == 0 || h == 0) {
+    dst[i] = orig[i];
+    return;
+  }
+  const r = Math.max(Math.floor(p[1] + 0.5) as i32, 1);
+  if (pass == 0) {
+    const x = (i % w) as i32;
+    const row = i - (x as u32);
+    const last = (w as i32) - 1;
+    let acc = vec4(0.0, 0.0, 0.0, 0.0);
+    for (let k = -r; k <= r; k++) {
+      const xx = Math.min(Math.max(x + k, 0), last);
+      const c = src[row + (xx as u32)];
+      acc = acc + vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+    }
+    dst[i] = acc;
+    return;
+  }
+  const x = i % w;
+  const y = (i / w) as i32;
+  const last = (h as i32) - 1;
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = -r; k <= r; k++) {
+    const yy = Math.min(Math.max(y + k, 0), last);
+    acc = acc + src[(yy as u32) * w + x];
+  }
+  const c = orig[i];
+  if (acc.w <= 0.0) {
+    dst[i] = c;
+    return;
+  }
+  const b = vec4(acc.x / acc.w, acc.y / acc.w, acc.z / acc.w, 1.0);
+  dst[i] = vec4(
+    Math.min(Math.max(c.x + (c.x - b.x) * a, 0.0), 1.0),
+    Math.min(Math.max(c.y + (c.y - b.y) * a, 0.0), 1.0),
+    Math.min(Math.max(c.z + (c.z - b.z) * a, 0.0), 1.0),
+    c.w,
+  );
+}
+
+kernel function sharpenCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export function fx_sharpen(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  let orig = new Buffer<vec4<f32>>(n);
+  dispatch(sharpenCopy, n, mut orig, layer);
+  dispatch(fx_gpu_sharpen, n, mut tmp, orig, orig, w, h, p, 0 as u32);
+  dispatch(fx_gpu_sharpen, n, mut layer, tmp, orig, w, h, p, 1 as u32);
+}
