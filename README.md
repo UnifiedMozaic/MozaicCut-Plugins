@@ -6,7 +6,7 @@
 
 ## 構成
 
-- `plugins/*.um` — 映像効果プラグイン（47 個）
+- `plugins/*.um` — 映像効果プラグイン（49 個）
 - `plugins/transitions/*.um` — トランジションプラグイン（16 個）
 - `tools/build.mjs` — 差分ビルド・ZIP パッケージ・MozaicCut 同期スクリプト
 - `.github/workflows/release.yml` — `v*` タグの push で `mozaiccut-plugins.zip` を自動リリース（Ubuntu 1 台で約 1 分）
