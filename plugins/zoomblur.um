@@ -1,0 +1,96 @@
+// @effect zoomblur "中心へ寄るようにぶらす（ズームのぶれ・放射状のブラー）"
+// @label "ズームブラー"
+// @category blur
+// @init 0.3
+// @thumb 0=0.3
+// @param amount 0 0..1 "強さ（中心からの距離のうち、ぶらす割合。0 で何もしない、1 で中心からの距離と同じ長さだけぶらす）"
+// @param cx 0.5 -0.5..1.5 "中心の横の位置（層の左端 0、右端 1）"
+// @param cy 0.5 -0.5..1.5 "中心の縦の位置（層の上端 0、下端 1）"
+// @whole
+// @gpu 2
+//
+// 画素 p の色を、中心 o から p への線の延長のうち、p から外へ amount × |p − o| の区間の色の平均にする
+// （o + (p − o) × s、s は 1 から 1 + amount まで。双線形補間。層の外は端の画素）。絵は中心の方へ尾を引く。
+// 段が見えないように、同じぶれを 2 回掛ける（1 回の割合 a は (1 + a)² = 1 + amount になる値。
+// 1 回ごとに区間の画素数 + 1 個（2〜64 個）を等間隔に取る）。中心の近くはほとんどぶれず、遠いほど長くぶれる。
+// rgb はアルファで重み付けして平均する（motionblur と同じ）。
+// 尾は中心の方（内側）へ伸びるので、文字・形の層の箱の外へははみ出さない（@reach は要らない）。
+// 画面全体をぶらすなら、project の行か comp の行に書く。
+
+kernel function zbTexel(src: Buffer<vec4<f32>>, x: i32, y: i32, w: u32, h: u32): vec4<f32> {
+  const cx = Math.min(Math.max(x, 0), (w as i32) - 1) as u32;
+  const cy = Math.min(Math.max(y, 0), (h as i32) - 1) as u32;
+  return src[cy * w + cx];
+}
+
+// 双線形補間（プリマルチプライにしてから混ぜる）
+kernel function zbSample(src: Buffer<vec4<f32>>, fx: f32, fy: f32, w: u32, h: u32): vec4<f32> {
+  const x = fx - 0.5;
+  const y = fy - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const tx = x - x0;
+  const ty = y - y0;
+  const ix = x0 as i32;
+  const iy = y0 as i32;
+  const a = zbTexel(src, ix, iy, w, h);
+  const b = zbTexel(src, ix + 1, iy, w, h);
+  const c = zbTexel(src, ix, iy + 1, w, h);
+  const d = zbTexel(src, ix + 1, iy + 1, w, h);
+  const pa = vec4(a.x * a.w, a.y * a.w, a.z * a.w, a.w);
+  const pb = vec4(b.x * b.w, b.y * b.w, b.z * b.w, b.w);
+  const pc = vec4(c.x * c.w, c.y * c.w, c.z * c.w, c.w);
+  const pd = vec4(d.x * d.w, d.y * d.w, d.z * d.w, d.w);
+  const top = pa + (pb - pa) * tx;
+  const bot = pc + (pd - pc) * tx;
+  return top + (bot - top) * ty;
+}
+
+export kernel function fx_gpu_zoomblur(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  // 2 回掛けて 1 + amount まで届くように、1 回の割合を √(1 + amount) − 1 にする
+  const amt = Math.sqrt(1.0 + Math.min(p[0], 1.0)) - 1.0;
+  const wf = w as f32;
+  const hf = h as f32;
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  const ox = p[1] * wf;
+  const oy = p[2] * hf;
+  const dx = px - ox;
+  const dy = py - oy;
+  const len = amt * Math.sqrt(dx * dx + dy * dy);
+  const n = Math.min(Math.max((Math.floor(len) as i32) + 1, 2), 64);
+  const step = amt / ((n - 1) as f32);
+  let acc = vec4(0.0, 0.0, 0.0, 0.0);
+  for (let k = 0; k < n; k++) {
+    const s = 1.0 + step * (k as f32);
+    acc = acc + zbSample(src, ox + dx * s, oy + dy * s, w, h);
+  }
+  const inv = 1.0 / (n as f32);
+  const a = Math.min(Math.max(acc.w * inv, 0.0), 1.0);
+  if (a <= 0.0 || acc.w <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  dst[i] = vec4(
+    Math.min(Math.max(acc.x / acc.w, 0.0), 1.0),
+    Math.min(Math.max(acc.y / acc.w, 0.0), 1.0),
+    Math.min(Math.max(acc.z / acc.w, 0.0), 1.0),
+    a,
+  );
+}
+
+export function fx_zoomblur(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_zoomblur, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(fx_gpu_zoomblur, n, mut layer, tmp, tmp, w, h, p, 1 as u32);
+}
