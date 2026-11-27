@@ -1,0 +1,146 @@
+// @effect rgbsplit "色を選べる RGB ずれ（層を 2〜3 色の写しにして、向きを分けてずらし、元の層を上に重ねる）"
+// @label "色ずれ（色を選ぶ）"
+// @category style
+// @init 8
+// @thumb 0=4
+// @param shift 8 0..256 "ずらす量（画素。0 で何もしない）"
+// @param angle 0 -360..360 "1 つ目の写しをずらす向き（度。0 で右、90 で下）。ほかの写しは円を等しく分けた向き"
+// @param color1 3073720 0..16777215 "1 つ目の写しの色（0xRRGGBB を 10 進で書く。既定 3073720 は 2ee6b8 のミント）"
+// @param color2 15245882 0..16777215 "2 つ目の写しの色（0xRRGGBB を 10 進で書く。既定 15245882 は e8a23a の黄）"
+// @param color3 -1 -1..16777215 "3 つ目の写しの色（0xRRGGBB を 10 進で書く。-1 で写しは 2 つ）"
+// @param jitter 0 0..1 "でたらめなずれ（ずらす量に対する割合。写しごとに seed で決まる向きへ足す）"
+// @param seed 0 0..100000 "乱数の種。コマごとに暴れさせるには seed=expr(floor(time*30)) のように時刻で変える"
+// @param keep 1 0..1 "元の層を写しの上に重ねる不透明度（0 で写しだけ）"
+// @reach shift 2
+// @whole
+// @gpu 1
+//
+// 写しは、元の画素の明るさ（輝度）に色を掛けたもの（白い文字なら選んだ色そのもの）。写しどうしは足し合わせる
+// （重なった所は明るくなり、ミントと黄なら白に近づく）。その上に元の層を keep の不透明度で重ねる。
+// 写しの向きは、写しが 2 つなら angle と反対、3 つなら 120 度ずつ。jitter は、seed と写しの番号から決まる
+// でたらめな向き・量（0〜shift × jitter）を足す。広がりは shift × (1 + jitter) なので、@reach は shift の 2 倍。
+
+kernel function rgbsSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function rgbsCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return rgbsSin(x + 0.5 * PI);
+}
+
+// 0〜1 の乱数。
+kernel function rgbsHash(n0: u32): f32 {
+  let n = n0;
+  n = (n ^ 61) ^ (n >> 16);
+  n = n + (n << 3);
+  n = n ^ (n >> 4);
+  n = n * 668265261;
+  n = n ^ (n >> 15);
+  return ((n & 65535) as f32) / 65535.0;
+}
+
+kernel function rgbsCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_rgbsplit(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const shift = p[0];
+  if (shift <= 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const maxX = (w as i32) - 1;
+  const maxY = (h as i32) - 1;
+  let n = 2;
+  if (p[4] >= 0.0) {
+    n = 3;
+  }
+  const seed = Math.max(Math.floor(p[6] + 0.5) as i32, 0) as u32;
+  const jit = Math.min(Math.max(p[5], 0.0), 1.0);
+  const base = p[1] * 0.0174532925;
+  // 写しを足し合わせる（色はプリマルチプライの形で足し、アルファは 1 - Π(1 - a)）
+  let sr = 0.0;
+  let sg = 0.0;
+  let sb = 0.0;
+  let clear = 1.0;
+  for (let k = 0; k < n; k++) {
+    let col = p[2];
+    if (k == 1) {
+      col = p[3];
+    } else if (k == 2) {
+      col = p[4];
+    }
+    // 色の数は 2^24 近くまであり、f32 では 0.5 を足すと偶数へ丸まる（16711935.5 → 16711936）ので、そのまま整数にする
+    const cv = Math.min(Math.max(col, 0.0), 16777215.0) as u32;
+    const cr = ((cv >> 16) & 255) as f32 / 255.0;
+    const cg = ((cv >> 8) & 255) as f32 / 255.0;
+    const cb = (cv & 255) as f32 / 255.0;
+    const a = base + (k as f32) * 6.283185307 / (n as f32);
+    let ox = shift * rgbsCos(a);
+    let oy = shift * rgbsSin(a);
+    if (jit > 0.0) {
+      const hs = seed * 7919 + (k as u32) * 104729 + 17;
+      const ja = rgbsHash(hs) * 6.283185307;
+      const jr = rgbsHash(hs + 1) * shift * jit;
+      ox = ox + jr * rgbsCos(ja);
+      oy = oy + jr * rgbsSin(ja);
+    }
+    const sx = Math.min(Math.max(x - (Math.floor(ox + 0.5) as i32), 0), maxX) as u32;
+    const sy = Math.min(Math.max(y - (Math.floor(oy + 0.5) as i32), 0), maxY) as u32;
+    const c = src[sy * w + sx];
+    const lum = Math.min(Math.max(0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z, 0.0), 1.0);
+    const ca = Math.min(Math.max(c.w, 0.0), 1.0);
+    sr = sr + cr * lum * ca;
+    sg = sg + cg * lum * ca;
+    sb = sb + cb * lum * ca;
+    clear = clear * (1.0 - ca);
+  }
+  const ea = 1.0 - clear;
+  // 元の層を keep の不透明度で上に重ねる（プリマルチプライで over）
+  const o = src[i];
+  const keep = Math.min(Math.max(p[7], 0.0), 1.0);
+  const oa = Math.min(Math.max(o.w, 0.0), 1.0) * keep;
+  const outA = oa + ea * (1.0 - oa);
+  if (outA <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  const pr = o.x * oa + Math.min(sr, 1.0) * (1.0 - oa);
+  const pg = o.y * oa + Math.min(sg, 1.0) * (1.0 - oa);
+  const pb = o.z * oa + Math.min(sb, 1.0) * (1.0 - oa);
+  dst[i] = vec4(
+    Math.min(Math.max(pr / outA, 0.0), 1.0),
+    Math.min(Math.max(pg / outA, 0.0), 1.0),
+    Math.min(Math.max(pb / outA, 0.0), 1.0),
+    outA,
+  );
+}
+
+export function fx_rgbsplit(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_rgbsplit, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(rgbsCopy, n, mut layer, tmp);
+}

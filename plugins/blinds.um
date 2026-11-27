@@ -1,0 +1,111 @@
+// @effect blinds "ブラインド（層を平行な帯で隠し、帯の太さをキーで動かす。トランジションではなく 1 つの層の効果）"
+// @label "ブラインド"
+// @category style
+// @init 0.5
+// @thumb 0=0.5 1=12
+// @param open 0.5 0..1 "見える帯の太さ（1 組の幅に対する割合。0 で全部隠れる、1 で全部見える。キーで動かす）"
+// @param width 24 2..2000 "1 組の帯の幅（画素。見える帯と隠れる帯を合わせた幅）"
+// @param angle 0 -180..180 "帯の向き（度。0 で横の帯、90 で縦の帯）"
+// @param offset 0 -100000..100000 "帯をずらす量（画素。キーで動かすと帯が流れる）"
+// @param soft 0 0..1 "境目のぼかし（1 組の幅に対する割合。0 でも 1 画素はなめらかにする）"
+// @param center 0.5 0..1 "見える帯が太る位置（0 で帯の上（左）の端から、0.5 で真ん中から、1 で下（右）の端から）"
+// @param stagger 0 0..1 "帯ごとの遅れ（上（左）の帯から順に開く。0 で全部の帯が同時）"
+// @param invert 0 0..1 "1 で見せる所と隠す所を入れ替える（小数は四捨五入）"
+// @whole
+// @gpu 1
+//
+// 層の中心を原点にして、angle だけ回した縦の座標 v（+ offset）を width ごとの組に分ける。組の中の位置 t（0〜1）が
+// [lo, lo + open]（lo = center × (1 - open)）にあれば見せる。stagger があると、組の番号 k（層の上の端を 0、
+// 下の端を 1 とした位置 f）ごとに、開き具合を open × (1 + stagger) - stagger × f にする（open 0 で全部隠れ、1 で全部見える）。
+// アルファだけを変える（色は変えない）。
+
+kernel function blndSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function blndCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return blndSin(x + 0.5 * PI);
+}
+
+kernel function blndCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_blinds(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const c = src[i];
+  if (w == 0 || h == 0) {
+    dst[i] = c;
+    return;
+  }
+  const inv = p[7] >= 0.5;
+  const open0 = Math.min(Math.max(p[0], 0.0), 1.0);
+  const width = Math.max(p[1], 1.0);
+  const rad = p[2] * 0.0174532925;
+  const sn = blndSin(rad);
+  const cs = blndCos(rad);
+  const hw = (w as f32) * 0.5;
+  const hh = (h as f32) * 0.5;
+  const x = ((i % w) as f32) + 0.5 - hw;
+  const y = ((i / w) as f32) + 0.5 - hh;
+  const v = -x * sn + y * cs + p[3];
+  // 層の上（回した向きで）の端から下の端までの、v の広がり（stagger の位置を決める）
+  const ext = Math.max(Math.abs(hw * sn) + Math.abs(hh * cs), 1.0);
+  const k = Math.floor(v / width);
+  const t = v / width - k;
+  let open = open0;
+  const stg = Math.min(Math.max(p[6], 0.0), 1.0);
+  if (stg > 0.0) {
+    // 組の中心の位置（0〜1。層の外の組は端に寄せる）
+    const f = Math.min(Math.max(((k + 0.5) * width - p[3] + ext) / (2.0 * ext), 0.0), 1.0);
+    open = Math.min(Math.max(open0 * (1.0 + stg) - stg * f, 0.0), 1.0);
+  }
+  let cov = 0.0;
+  if (open >= 1.0) {
+    cov = 1.0;
+  } else if (open > 0.0) {
+    const lo = Math.min(Math.max(p[5], 0.0), 1.0) * (1.0 - open);
+    const hi = lo + open;
+    const s = Math.max(Math.min(Math.max(p[4], 0.0), 1.0) * width * 0.5, 1.0);
+    // 組の端に接する側（lo が 0、hi が 1）は、隣の組とつながるので境目にしない
+    let a = 1.0;
+    if (lo > 0.0) {
+      a = Math.min(Math.max((t - lo) * width / s + 0.5, 0.0), 1.0);
+    }
+    let b = 1.0;
+    if (hi < 1.0) {
+      b = Math.min(Math.max((hi - t) * width / s + 0.5, 0.0), 1.0);
+    }
+    cov = a * b;
+  }
+  if (inv) {
+    cov = 1.0 - cov;
+  }
+  dst[i] = vec4(c.x, c.y, c.z, c.w * cov);
+}
+
+export function fx_blinds(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_blinds, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(blndCopy, n, mut layer, tmp);
+}

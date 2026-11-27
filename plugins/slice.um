@@ -1,0 +1,131 @@
+// @effect slice "スライスのずれ（層を横か縦の帯に分けて、帯ごとにでたらめにずらす。ブロックに分けるとブロックのグリッチ）"
+// @label "スライスずれ"
+// @category style
+// @init 24
+// @thumb 0=10 1=8
+// @param amount 24 0..512 "いちばん大きいずれ（画素。0 で何もしない）"
+// @param count 12 1..256 "帯の本数（層の高さを分ける数。縦の帯なら幅を分ける数。小数は四捨五入）"
+// @param vertical 0 0..1 "向き（0 で横の帯を横へずらす、1 で縦の帯を縦へずらす。小数は四捨五入）"
+// @param seed 0 0..100000 "乱数の種。コマごとに変えるには seed=expr(floor(time*30)) のように時刻で変える"
+// @param ratio 0.6 0..1 "ずらす帯の割合（0 でどの帯もずれない、1 で全部の帯がずれる）"
+// @param blocks 1 1..64 "帯をさらに横に（縦の帯なら縦に）分ける数（1 で帯のまま、2 以上でブロックごとにずれる。小数は四捨五入）"
+// @param uneven 0.6 0..1 "帯の太さのばらつき（0 で同じ太さ）"
+// @param wrap 0 0..1 "はみ出した所（0 で透明にする、1 で反対の端から回り込ませる。小数は四捨五入）"
+// @reach amount 1
+// @whole
+// @gpu 1
+//
+// 帯の境目は、等しい間隔の境目を、seed から決まる量（間隔 × uneven の半分まで）だけ動かしたもの（順は入れ替わらない）。
+// 画素がどの帯・どのブロックにあるかは、ずらす前の（書き込む側の）座標で決める。帯ごと（ブロックごと）に、
+// seed と帯の番号から、ずらすかどうか（ratio）と、-amount〜amount のずれを決める。
+
+// 0〜1 の乱数。
+kernel function sliceHash(n0: u32): f32 {
+  let n = n0;
+  n = (n ^ 61) ^ (n >> 16);
+  n = n + (n << 3);
+  n = n ^ (n >> 4);
+  n = n * 668265261;
+  n = n ^ (n >> 15);
+  return ((n & 65535) as f32) / 65535.0;
+}
+
+// 長さ len を cnt 本に分けたとき、境目 k（1〜cnt-1）の位置。0 と cnt は両端。
+kernel function sliceEdge(k: i32, cnt: i32, len: f32, uneven: f32, salt: u32): f32 {
+  const step = len / (cnt as f32);
+  if (k <= 0) {
+    return 0.0;
+  }
+  if (k >= cnt) {
+    return len;
+  }
+  const r = sliceHash((k as u32) * 2654435761 + salt) - 0.5;
+  return ((k as f32) + r * uneven) * step;
+}
+
+// 座標 v が、長さ len を cnt 本に分けた帯のどれにあるか。
+kernel function sliceBand(v: f32, cnt: i32, len: f32, uneven: f32, salt: u32): i32 {
+  const step = len / (cnt as f32);
+  let k = Math.min(Math.max(Math.floor(v / step) as i32, 0), cnt - 1);
+  // 境目は等しい間隔から半分の間隔より少なく動くので、隣の帯を見れば足りる
+  if (k > 0 && v < sliceEdge(k, cnt, len, uneven, salt)) {
+    k = k - 1;
+  } else if (k < cnt - 1 && v >= sliceEdge(k + 1, cnt, len, uneven, salt)) {
+    k = k + 1;
+  }
+  return k;
+}
+
+kernel function sliceCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_slice(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const amt = p[0];
+  if (amt <= 0.0 || w == 0 || h == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  const x = (i % w) as i32;
+  const y = (i / w) as i32;
+  const vert = p[2] >= 0.5;
+  const cnt = Math.max(Math.floor(p[1] + 0.5) as i32, 1);
+  const blocks = Math.max(Math.floor(p[5] + 0.5) as i32, 1);
+  const seed = Math.max(Math.floor(p[3] + 0.5) as i32, 0) as u32;
+  const uneven = Math.min(Math.max(p[6], 0.0), 0.95);
+  const ratio = Math.min(Math.max(p[4], 0.0), 1.0);
+  // across: 帯を分ける向きの座標と長さ、along: ずらす向きの座標と長さ
+  let across = y;
+  let along = x;
+  let lenAcross = h as i32;
+  let lenAlong = w as i32;
+  if (vert) {
+    across = x;
+    along = y;
+    lenAcross = w as i32;
+    lenAlong = h as i32;
+  }
+  const salt = seed * 7919 + 101;
+  const band = sliceBand((across as f32) + 0.5, cnt, lenAcross as f32, uneven, salt);
+  let block = 0;
+  if (blocks > 1) {
+    block = sliceBand((along as f32) + 0.5, blocks, lenAlong as f32, uneven, salt + (band as u32) * 31337 + 7);
+  }
+  const cell = (band as u32) * 977 + (block as u32) * 104729 + seed * 2246822519;
+  let shift = 0;
+  if (sliceHash(cell + 3) < ratio) {
+    shift = Math.floor((sliceHash(cell + 11) * 2.0 - 1.0) * amt + 0.5) as i32;
+  }
+  if (shift == 0) {
+    dst[i] = src[i];
+    return;
+  }
+  let s = along - shift;
+  if (s < 0 || s >= lenAlong) {
+    if (p[7] < 0.5) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    s = s % lenAlong;
+    if (s < 0) {
+      s = s + lenAlong;
+    }
+  }
+  if (vert) {
+    dst[i] = src[(s as u32) * w + (x as u32)];
+  } else {
+    dst[i] = src[(y as u32) * w + (s as u32)];
+  }
+}
+
+export function fx_slice(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  dispatch(fx_gpu_slice, n, mut tmp, layer, layer, w, h, p, 0 as u32);
+  dispatch(sliceCopy, n, mut layer, tmp);
+}
