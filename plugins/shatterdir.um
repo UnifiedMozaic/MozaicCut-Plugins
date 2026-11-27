@@ -1,0 +1,397 @@
+// @effect shatterdir "向きのある破片（層の形を三角の破片に割り、dir の向きへ散らす。amount をキーで 0 から 1 へ動かす。四方に散らすなら shatter）"
+// @label "向きのある破片"
+// @category style
+// @init 0.4
+// @thumb 0=0.35 2=60
+// @param amount 0 0..1 "飛び散り具合（0 で割れていない、1 で飛び切る）"
+// @param count 60 2..600 "破片の数（おおよそ。形のある所を囲む四角を分ける）"
+// @param distance 240 0..512 "amount=1 で飛ぶ距離（画素。破片ごとにばらつく）"
+// @param rotate 180 0..1440 "amount=1 でのいちばん大きい回転（度。破片ごとに向きと量が違う）"
+// @param gravity 0.4 0..2 "dir の向きへの偏り（重力）の強さ。飛ぶ向きをその向きへ寄せ、amount の 2 乗に比例して流す（distance に対する割合）"
+// @param seed 0 0..100000 "乱数の種（割れ方と飛び方が変わる）"
+// @param fade 0.6 0..1 "消えていく量（amount=1 での透明さ。0 で消えない）"
+// @param dir 90 -360..360 "散る向き（度。0 が右、90 が下、180 が左、-90 が上。gravity の強さでこの向きへ偏る）"
+// @reach distance 3.5
+// @whole
+// @gpu 4
+//
+// 層には @reach の分（ほかの効果の分も足した）透明な余白が付くので、破片は層全体ではなく、形のある所（アルファが 0 より
+// 大きい画素）を囲む四角を、ずらした格子で四角に分け、四角ごとに 2 つの三角にしたもの。
+// パス（GPU は 4 回。CPU も同じ kernel を同じ順に 4 回 dispatch する）:
+//   0: 行ごとに、形のある横の範囲を探して、その行の左端の画素に書く
+//   1: 0 番の画素に、行の範囲をまとめた四角（左・上・右・下）を書く
+//   2: 1 番からの画素に、破片の表（破片ごとに vec4 を 4 つ: 頂点、重心、動いた後の重心と回転、外接円と不透明度）を書く
+//   3: 画素ごとに、破片を順に見て、動いた破片をもとの位置へ戻した点が三角の中なら、その点の色を前から重ねる
+// 破片の向きは、重心が四角の中心から離れる向き（ばらつき ±0.5）に、dir の向きを gravity 倍して足したもの
+// （gravity が 1 を超えると、ほとんどの破片が dir の側へ飛ぶ）。その向きへ distance × amount × 速さ（0.35〜1、±25%）
+// 動き、さらに dir の向きへ gravity × distance × amount² だけ流れる。いちばん遠くて distance × (1.25 + 2) なので、
+// 広がり（@reach）は distance × 3.5。
+// shatter（四方に散る）と同じ作りで、向きを足した別の効果。引数は 8 個まで（効果のプラグインの決まり）なので、
+// shatter の random（ばらつき）は 0.5 に決めて、その場所を dir に使う。shatter の書き方と絵は変えない。
+
+kernel function shatSin(x0: f32): f32 {
+  const PI: f32 = 3.14159265;
+  let x = x0;
+  while (x > PI) {
+    x = x - 2.0 * PI;
+  }
+  while (x < -PI) {
+    x = x + 2.0 * PI;
+  }
+  if (x > 0.5 * PI) {
+    x = PI - x;
+  } else if (x < -0.5 * PI) {
+    x = -PI - x;
+  }
+  const x2 = x * x;
+  return x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0))));
+}
+
+kernel function shatCos(x: f32): f32 {
+  const PI: f32 = 3.14159265;
+  return shatSin(x + 0.5 * PI);
+}
+
+// 0〜1 の乱数。
+kernel function shatHash(n0: u32): f32 {
+  let n = n0;
+  n = (n ^ 61) ^ (n >> 16);
+  n = n + (n << 3);
+  n = n ^ (n >> 4);
+  n = n * 668265261;
+  n = n ^ (n >> 15);
+  return ((n & 65535) as f32) / 65535.0;
+}
+
+// 四角（bw × bh）を分ける格子の列の数と行の数。破片の表が層の画素に収まるように減らす。
+kernel function shatCols(bw: f32, bh: f32, count: f32, n: u32): i32 {
+  const cells = Math.max(Math.floor(count * 0.5 + 0.5), 1.0);
+  let cols = Math.min(Math.max(Math.floor(Math.sqrt(cells * bw / Math.max(bh, 1.0)) + 0.5) as i32, 1), 64);
+  let rows = Math.min(Math.max(Math.floor(cells / (cols as f32) + 0.5) as i32, 1), 64);
+  while (1 + 8 * cols * rows > (n as i32) && (cols > 1 || rows > 1)) {
+    if (cols >= rows) {
+      cols = cols - 1;
+    } else {
+      rows = rows - 1;
+    }
+  }
+  return cols;
+}
+
+kernel function shatRows(bw: f32, bh: f32, count: f32, n: u32): i32 {
+  const cells = Math.max(Math.floor(count * 0.5 + 0.5), 1.0);
+  let cols = Math.min(Math.max(Math.floor(Math.sqrt(cells * bw / Math.max(bh, 1.0)) + 0.5) as i32, 1), 64);
+  let rows = Math.min(Math.max(Math.floor(cells / (cols as f32) + 0.5) as i32, 1), 64);
+  while (1 + 8 * cols * rows > (n as i32) && (cols > 1 || rows > 1)) {
+    if (cols >= rows) {
+      cols = cols - 1;
+    } else {
+      rows = rows - 1;
+    }
+  }
+  return rows;
+}
+
+// 格子の点 (gx, gy) の位置の x（内側の点だけ、seed で決まる量ずらす）。
+kernel function shatGridX(gx: i32, gy: i32, cols: i32, x0: f32, cw: f32, salt: u32): f32 {
+  let v = x0 + (gx as f32) * cw;
+  if (gx > 0 && gx < cols) {
+    v = v + (shatHash(((gy * 131 + gx) as u32) * 2 + salt) - 0.5) * 0.7 * cw;
+  }
+  return v;
+}
+
+kernel function shatGridY(gx: i32, gy: i32, rows: i32, y0: f32, ch: f32, salt: u32): f32 {
+  let v = y0 + (gy as f32) * ch;
+  if (gy > 0 && gy < rows) {
+    v = v + (shatHash(((gy * 131 + gx) as u32) * 2 + 1 + salt) - 0.5) * 0.7 * ch;
+  }
+  return v;
+}
+
+// orig の (fx, fy)（画素の中心が +0.5）の色。アルファで重み付けした双線形で読み、プリマルチプライの形で返す。
+kernel function shatSample(orig: Buffer<vec4<f32>>, w: u32, h: u32, fx: f32, fy: f32): vec4<f32> {
+  const sx = fx - 0.5;
+  const sy = fy - 0.5;
+  const ix = Math.floor(sx) as i32;
+  const iy = Math.floor(sy) as i32;
+  const tx = sx - (ix as f32);
+  const ty = sy - (iy as f32);
+  let r = 0.0;
+  let g = 0.0;
+  let b = 0.0;
+  let a = 0.0;
+  for (let k = 0; k < 4; k++) {
+    const xx = ix + (k & 1);
+    const yy = iy + (k >> 1);
+    if (xx >= 0 && yy >= 0 && xx < (w as i32) && yy < (h as i32)) {
+      let wt = 1.0 - tx;
+      if ((k & 1) == 1) {
+        wt = tx;
+      }
+      if ((k >> 1) == 1) {
+        wt = wt * ty;
+      } else {
+        wt = wt * (1.0 - ty);
+      }
+      const c = orig[(yy as u32) * w + (xx as u32)];
+      const ca = Math.min(Math.max(c.w, 0.0), 1.0) * wt;
+      r = r + c.x * ca;
+      g = g + c.y * ca;
+      b = b + c.z * ca;
+      a = a + ca;
+    }
+  }
+  return vec4(r, g, b, a);
+}
+
+kernel function shatCopy(i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>): void {
+  dst[i] = src[i];
+}
+
+export kernel function fx_gpu_shatterdir(
+  i: u32, dst: mut Buffer<vec4<f32>>, src: Buffer<vec4<f32>>, orig: Buffer<vec4<f32>>,
+  w: u32, h: u32, p: f32[8], pass: u32,
+): void {
+  const amt = Math.min(Math.max(p[0], 0.0), 1.0);
+  if (amt <= 0.0 || w == 0 || h == 0) {
+    dst[i] = orig[i];
+    return;
+  }
+  const n = w * h;
+  if (pass == 0) {
+    // 行の形のある横の範囲（左, 右, あれば 1）
+    if (i % w != 0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    let lo = -1;
+    let hi = -1;
+    for (let x: u32 = 0; x < w; x++) {
+      if (orig[i + x].w > 0.0) {
+        if (lo < 0) {
+          lo = x as i32;
+        }
+        hi = x as i32;
+      }
+    }
+    if (lo < 0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    } else {
+      dst[i] = vec4(lo as f32, hi as f32, 1.0, 0.0);
+    }
+    return;
+  }
+  if (pass == 1) {
+    // 形のある所を囲む四角（左, 上, 右 + 1, 下 + 1）。なければ右 < 左
+    if (i != 0) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    let l = w as f32;
+    let t = h as f32;
+    let r = -1.0;
+    let b = -1.0;
+    for (let y: u32 = 0; y < h; y++) {
+      const v = src[y * w];
+      if (v.z > 0.5) {
+        l = Math.min(l, v.x);
+        r = Math.max(r, v.y + 1.0);
+        t = Math.min(t, y as f32);
+        b = Math.max(b, (y + 1) as f32);
+      }
+    }
+    dst[i] = vec4(l, t, r, b);
+    return;
+  }
+  const box = src[0];
+  const bw = box.z - box.x;
+  const bh = box.w - box.y;
+  if (bw <= 0.0 || bh <= 0.0) {
+    dst[i] = orig[i];
+    return;
+  }
+  const cols = shatCols(bw, bh, p[1], n);
+  const rows = shatRows(bw, bh, p[1], n);
+  const shards = (cols * rows * 2) as u32;
+  if (pass == 2) {
+    // 破片の表
+    if (i == 0) {
+      dst[i] = box;
+      return;
+    }
+    if (i > shards * 4) {
+      dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+    const s = (i - 1) / 4;
+    const part = (i - 1) % 4;
+    const seed = Math.max(Math.floor(p[5] + 0.5) as i32, 0) as u32;
+    const salt = seed * 7919 + 13;
+    const cell = (s / 2) as i32;
+    const half = (s % 2) as i32;
+    const cx = cell % cols;
+    const cy = cell / cols;
+    const cw = bw / (cols as f32);
+    const ch = bh / (rows as f32);
+    const x00 = shatGridX(cx, cy, cols, box.x, cw, salt);
+    const y00 = shatGridY(cx, cy, rows, box.y, ch, salt);
+    const x10 = shatGridX(cx + 1, cy, cols, box.x, cw, salt);
+    const y10 = shatGridY(cx + 1, cy, rows, box.y, ch, salt);
+    const x01 = shatGridX(cx, cy + 1, cols, box.x, cw, salt);
+    const y01 = shatGridY(cx, cy + 1, rows, box.y, ch, salt);
+    const x11 = shatGridX(cx + 1, cy + 1, cols, box.x, cw, salt);
+    const y11 = shatGridY(cx + 1, cy + 1, rows, box.y, ch, salt);
+    // 四角を 2 つの三角に分ける対角線は、四角ごとにでたらめに選ぶ
+    const flip = shatHash((cell as u32) * 3 + salt + 977) < 0.5;
+    let ax = x00;
+    let ay = y00;
+    let bx = x10;
+    let by = y10;
+    let qx = x11;
+    let qy = y11;
+    if (!flip) {
+      if (half == 1) {
+        bx = x11;
+        by = y11;
+        qx = x01;
+        qy = y01;
+      }
+    } else {
+      if (half == 0) {
+        qx = x01;
+        qy = y01;
+      } else {
+        ax = x10;
+        ay = y10;
+        bx = x11;
+        by = y11;
+        qx = x01;
+        qy = y01;
+      }
+    }
+    if (part == 0) {
+      dst[i] = vec4(ax, ay, bx, by);
+      return;
+    }
+    const gx = (ax + bx + qx) / 3.0;
+    const gy = (ay + by + qy) / 3.0;
+    if (part == 1) {
+      dst[i] = vec4(qx, qy, gx, gy);
+      return;
+    }
+    const hs = s * 6151 + salt * 3 + 5;
+    const rnd = 0.5;
+    const dist = Math.max(p[2], 0.0);
+    if (part == 2) {
+      // 向き: 四角の中心から重心へ。ばらつきでずらし、dir の向きを gravity 倍して足す
+      const ex = box.x + bw * 0.5;
+      const ey = box.y + bh * 0.5;
+      let dx = gx - ex;
+      let dy = gy - ey;
+      const maxR = Math.max(0.5 * Math.sqrt(bw * bw + bh * bh), 1.0);
+      const near = Math.min(Math.sqrt(dx * dx + dy * dy) / maxR, 1.0);
+      const len0 = Math.sqrt(dx * dx + dy * dy);
+      if (len0 < 0.001) {
+        const ra = shatHash(hs) * 6.283185307;
+        dx = shatCos(ra);
+        dy = shatSin(ra);
+      } else {
+        dx = dx / len0;
+        dy = dy / len0;
+      }
+      dx = dx + (shatHash(hs + 1) - 0.5) * 2.0 * rnd;
+      dy = dy + (shatHash(hs + 2) - 0.5) * 2.0 * rnd;
+      const grav = Math.min(Math.max(p[4], 0.0), 2.0);
+      const ang = p[7] * 0.0174532925;
+      const ux = shatCos(ang);
+      const uy = shatSin(ang);
+      const l1 = Math.max(Math.sqrt(dx * dx + dy * dy), 0.001);
+      dx = dx / l1 + ux * grav;
+      dy = dy / l1 + uy * grav;
+      let len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.001) {
+        // 外へ向く向きと dir がちょうど打ち消し合ったら、dir の向きへ
+        dx = ux;
+        dy = uy;
+        len = 1.0;
+      }
+      const speed = (0.35 + 0.65 * near) * (1.0 + (shatHash(hs + 3) - 0.5) * rnd);
+      const mv = dist * amt * speed;
+      const nx = gx + dx / len * mv + ux * grav * dist * amt * amt;
+      const ny = gy + dy / len * mv + uy * grav * dist * amt * amt;
+      const rot = p[3] * 0.0174532925 * amt * (shatHash(hs + 4) * 2.0 - 1.0);
+      dst[i] = vec4(nx, ny, shatCos(rot), shatSin(rot));
+      return;
+    }
+    // 外接円の半径（重心からいちばん遠い頂点まで）と不透明度
+    const r2 = Math.max(Math.max((ax - gx) * (ax - gx) + (ay - gy) * (ay - gy), (bx - gx) * (bx - gx) + (by - gy) * (by - gy)),
+      (qx - gx) * (qx - gx) + (qy - gy) * (qy - gy));
+    const fade = Math.min(Math.max(p[6], 0.0), 1.0);
+    dst[i] = vec4(Math.sqrt(r2) + 1.0, 1.0 - fade * amt, 0.0, 0.0);
+    return;
+  }
+  // pass 3: 破片を描く
+  const px = ((i % w) as f32) + 0.5;
+  const py = ((i / w) as f32) + 0.5;
+  let ar = 0.0;
+  let ag = 0.0;
+  let ab = 0.0;
+  let aa = 0.0;
+  for (let s: u32 = 0; s < shards; s++) {
+    const mv = src[1 + s * 4 + 2];
+    const ex = src[1 + s * 4 + 3];
+    const ox = px - mv.x;
+    const oy = py - mv.y;
+    if (ox * ox + oy * oy > ex.x * ex.x || ex.y <= 0.0) {
+      continue;
+    }
+    const v0 = src[1 + s * 4];
+    const v1 = src[1 + s * 4 + 1];
+    // もとの位置へ戻す（回転を逆に）
+    const qx = v1.z + mv.z * ox + mv.w * oy;
+    const qy = v1.w - mv.w * ox + mv.z * oy;
+    // 三角の中か（辺の向きによらないように、符号がそろっているかで見る）
+    const e0 = (v0.z - v0.x) * (qy - v0.y) - (v0.w - v0.y) * (qx - v0.x);
+    const e1 = (v1.x - v0.z) * (qy - v0.w) - (v1.y - v0.w) * (qx - v0.z);
+    const e2 = (v0.x - v1.x) * (qy - v1.y) - (v0.y - v1.y) * (qx - v1.x);
+    const eps = 0.0001;
+    const inPos = e0 >= -eps && e1 >= -eps && e2 >= -eps;
+    const inNeg = e0 <= eps && e1 <= eps && e2 <= eps;
+    if (!inPos && !inNeg) {
+      continue;
+    }
+    const c = shatSample(orig, w, h, qx, qy);
+    const k = (1.0 - aa) * ex.y;
+    ar = ar + c.x * k;
+    ag = ag + c.y * k;
+    ab = ab + c.z * k;
+    aa = aa + c.w * k;
+    if (aa >= 0.998) {
+      break;
+    }
+  }
+  if (aa <= 0.0) {
+    dst[i] = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+  dst[i] = vec4(
+    Math.min(Math.max(ar / aa, 0.0), 1.0),
+    Math.min(Math.max(ag / aa, 0.0), 1.0),
+    Math.min(Math.max(ab / aa, 0.0), 1.0),
+    Math.min(aa, 1.0),
+  );
+}
+
+export function fx_shatterdir(layer: mut Buffer<vec4<f32>>, tmp: mut Buffer<vec4<f32>>, w: u32, h: u32, p: f32[8]): void {
+  if (p[0] <= 0.0 || w == 0 || h == 0) {
+    return;
+  }
+  const n = w * h;
+  let orig = new Buffer<vec4<f32>>(n);
+  dispatch(shatCopy, n, mut orig, layer);
+  dispatch(fx_gpu_shatterdir, n, mut tmp, layer, orig, w, h, p, 0 as u32);
+  dispatch(fx_gpu_shatterdir, n, mut layer, tmp, orig, w, h, p, 1 as u32);
+  dispatch(fx_gpu_shatterdir, n, mut tmp, layer, orig, w, h, p, 2 as u32);
+  dispatch(fx_gpu_shatterdir, n, mut layer, tmp, orig, w, h, p, 3 as u32);
+}
